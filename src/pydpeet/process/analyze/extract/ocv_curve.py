@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.interpolate import PchipInterpolator
@@ -240,6 +241,71 @@ def _screen_ocv_points(
     return result
 
 
+def _plot_ocv_curves(
+    points: pd.DataFrame,
+    curves: pd.DataFrame,
+    soc_column: str,
+    voltage_column: str,
+) -> None:
+    """Show screened points and fitted curves separately for each iOCV block."""
+    block_ids = points["ocv_block_id"].drop_duplicates().tolist()
+    ncols = min(2, len(block_ids))
+    nrows = (len(block_ids) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), squeeze=False)
+    styles = {"charge": ("#0072B2", "-"), "discharge": ("#D55E00", "--")}
+
+    for ax, block_id in zip(axes.flat, block_ids, strict=False):
+        block_points = points.loc[points["ocv_block_id"].eq(block_id)]
+        block_curves = curves.loc[curves["ocv_block_id"].eq(block_id)]
+        for direction, group in block_points.groupby("direction", sort=True):
+            color, linestyle = styles.get(direction, ("#777777", ":"))
+            soc = pd.to_numeric(group[soc_column], errors="coerce")
+            voltage = pd.to_numeric(group[voltage_column], errors="coerce")
+            finite = np.isfinite(soc) & np.isfinite(voltage)
+            kept = finite & group["is_valid_for_ocv"]
+            excluded = finite & ~group["is_valid_for_ocv"]
+            if kept.any():
+                ax.scatter(
+                    soc.loc[kept],
+                    voltage.loc[kept],
+                    facecolors="none",
+                    edgecolors=color,
+                    s=24,
+                    label=f"{direction.capitalize()} kept points",
+                    zorder=3,
+                )
+            if excluded.any():
+                ax.scatter(
+                    soc.loc[excluded],
+                    voltage.loc[excluded],
+                    color="#777777",
+                    marker="x",
+                    s=32,
+                    label=f"{direction.capitalize()} excluded points",
+                    zorder=3,
+                )
+            fitted = block_curves.loc[block_curves["direction"].eq(direction)].sort_values("SOC")
+            if not fitted.empty:
+                ax.plot(
+                    fitted["SOC"],
+                    fitted["OCV[V]"],
+                    color=color,
+                    linestyle=linestyle,
+                    linewidth=1.8,
+                    label=f"{direction.capitalize()} fit",
+                )
+        ax.set_title(f"iOCV block {block_id}")
+        ax.set_xlabel("SOC")
+        ax.set_ylabel("OCV [V]")
+        ax.grid(True, linestyle="--", alpha=0.3)
+        ax.legend(frameon=False)
+
+    for ax in axes.flat[len(block_ids) :]:
+        ax.set_visible(False)
+    fig.tight_layout()
+    plt.show()
+
+
 def create_ocv_curves(
     ocv_blocks: list[pd.DataFrame],
     df_primitives: pd.DataFrame,
@@ -256,6 +322,7 @@ def create_ocv_curves(
     voltage_column: str = "Voltage[V]",
     current_column: str = "Current[A]",
     time_column: str = "Test_Time[s]",
+    visualize: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Quality-screen iOCV blocks and build separate charge/discharge curves.
 
