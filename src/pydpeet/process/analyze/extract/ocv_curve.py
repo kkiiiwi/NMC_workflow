@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import warnings
+from collections.abc import Mapping
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -17,18 +20,26 @@ _QUALITY_COLUMNS = [
 
 
 def _weighted_pava(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    """Return the weighted non-decreasing isotonic fit of ``values``."""
+    """Fit a non-decreasing sequence using weighted isotonic regression.
+    
+    Adjacent blocks that violate the monotonicity constraint are merged and replaced by their weighted mean
+    until the sequence is non-decreasing.
+    In the OCV workflow, each weight corresponds to the number of measurements in the associated SOC bin."""
+    
     block_values: list[float] = []
     block_weights: list[float] = []
     block_starts: list[int] = []
     block_ends: list[int] = []
 
     for index, (value, weight) in enumerate(zip(values, weights, strict=True)):
+        
+        # Treat each observation as an individual block initially.
         block_values.append(float(value))
         block_weights.append(float(weight))
         block_starts.append(index)
         block_ends.append(index)
 
+        # Merge adjacent violating blocks until the sequence is non-decreasing.
         while len(block_values) >= 2 and block_values[-2] > block_values[-1]:
             merged_weight = block_weights[-2] + block_weights[-1]
             merged_value = (block_values[-2] * block_weights[-2] + block_values[-1] * block_weights[-1]) / merged_weight
@@ -38,6 +49,8 @@ def _weighted_pava(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
             block_ends[-2:] = [block_ends[-1]]
 
     fitted = np.empty(len(values), dtype=float)
+
+    # Expand fitted blocks back to the original indices.
     for value, start, end in zip(block_values, block_starts, block_ends, strict=True):
         fitted[start : end + 1] = value
     return fitted
@@ -50,44 +63,16 @@ def fit_ocv_soc_curve(
     soc_column: str = "SOC",
     voltage_column: str = "Voltage[V]",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    
     """Build a monotonic OCV-SOC curve from extracted OCV points.
 
-    Points are grouped into SOC bins. The median voltage in every occupied bin
-    is made non-decreasing with weighted pool-adjacent-violators regression
-    (PAVA), using the number of points in each bin as its weight. A
-    shape-preserving PCHIP interpolator then evaluates the curve only across
-    the observed SOC range; no extrapolation is performed.
+   OCV points are grouped into SOC bins, and the median voltages are made non-decreasing using weighted PAVA.
+   The resulting values are interpolated with PCHIP over the observed SOC range.
 
-    Charge and discharge points should be passed separately so their voltage
-    hysteresis remains visible.
-
-    Parameters
-    ----------
-    df_ocv_points : pandas.DataFrame
-        Extracted OCV points containing SOC and voltage columns.
-    bin_width : float, default 0.01
-        Width of the SOC bins, expressed on the normalized interval [0, 1].
-    grid_step : float, default 0.001
-        SOC spacing of the interpolated output curve. Must not exceed
-        ``bin_width``.
-    soc_column : str, default "SOC"
-        Name of the normalized SOC column.
-    voltage_column : str, default "Voltage[V]"
-        Name of the OCV-point voltage column.
-
-    Returns
-    -------
-    tuple[pandas.DataFrame, pandas.DataFrame]
-        The first DataFrame contains bin statistics and the PAVA-adjusted
-        voltage. The second contains the PCHIP-interpolated ``SOC`` and
-        ``OCV[V]`` curve.
-
-    Raises
-    ------
-    ValueError
-        If parameters or required columns are invalid, or fewer than two SOC
-        bins contain usable finite data.
+   Charge and discharge points should be processed separately to preserve voltage hysteresis.
     """
+
+    # Validate input data and fitting parameters
     if not isinstance(df_ocv_points, pd.DataFrame):
         raise ValueError("df_ocv_points must be a pandas DataFrame.")
     missing = [column for column in (soc_column, voltage_column) if column not in df_ocv_points.columns]
@@ -98,6 +83,7 @@ def fit_ocv_soc_curve(
     if not 0 < grid_step <= bin_width:
         raise ValueError("grid_step must be greater than 0 and at most bin_width.")
 
+    # Keep only finite OCV points within the normalized SOC range.
     points = df_ocv_points[[soc_column, voltage_column]].copy()
     points[soc_column] = pd.to_numeric(points[soc_column], errors="coerce")
     points[voltage_column] = pd.to_numeric(points[voltage_column], errors="coerce")
@@ -106,6 +92,7 @@ def fit_ocv_soc_curve(
     if points.empty:
         raise ValueError("No finite OCV points within the normalized SOC range [0, 1].")
 
+    # Group OCV point into SOC bins and calculate robust voltage statistics.
     edges = np.arange(0.0, 1.0, bin_width)
     edges = np.append(edges, 1.0)
     edges = np.unique(np.clip(edges, 0.0, 1.0))
@@ -130,6 +117,7 @@ def fit_ocv_soc_curve(
     if len(binned) < 2:
         raise ValueError("At least two SOC bins must contain usable OCV points.")
 
+    # Enforce a non-decreasing OCV-SOC relationship using weighted PAVA.
     bin_indices = binned["soc_bin"].astype(int).to_numpy()
     binned["SOC"] = (edges[bin_indices] + edges[bin_indices + 1]) / 2.0
     binned["ocv_monotonic_V"] = _weighted_pava(
@@ -137,12 +125,14 @@ def fit_ocv_soc_curve(
         binned["n"].to_numpy(float),
     )
 
+    # Build and evalute the PCHIP curve over the observed SOC range.
     soc = binned["SOC"].to_numpy(float)
     voltage = binned["ocv_monotonic_V"].to_numpy(float)
     grid = np.arange(soc.min(), soc.max() + grid_step * 0.5, grid_step)
     grid = grid[grid <= soc.max() + np.finfo(float).eps * 8]
     if grid[-1] < soc.max() - np.finfo(float).eps * 8:
         grid = np.append(grid, soc.max())
+
     curve = pd.DataFrame(
         {
             "SOC": grid,
@@ -159,10 +149,20 @@ def _rest_quality_metrics(
     time_column: str,
     voltage_column: str,
 ) -> pd.DataFrame:
+    
+    """Calculate rest-end stability metrics for extracted OCV points.
+    For each selected rest segment, the total rest duration and voltage stability over the final tail_window_s seconds are calculated. 
+    
+    This function only calculates quality metrics and does not accept or reject OCV points.
+    """
+
+    # Select only the rest segments associated with extracted OCV points.
     rest = df_primitives.loc[
         df_primitives["ID"].isin(point_ids) & df_primitives["Type"].eq("Rest"),
         ["ID", time_column, voltage_column],
     ].copy()
+
+    # Remove samples whose time or voltage cannot be interpreted numerically.
     rest[time_column] = pd.to_numeric(rest[time_column], errors="coerce")
     rest[voltage_column] = pd.to_numeric(rest[voltage_column], errors="coerce")
     rest = rest.dropna(subset=[time_column, voltage_column])
@@ -173,10 +173,14 @@ def _rest_quality_metrics(
         time_s = group[time_column].to_numpy(float)
         voltage_v = group[voltage_column].to_numpy(float)
         end_s = float(time_s[-1])
+
+        # Select samples within the final tail_window_s seconds.
         tail = time_s >= end_s - tail_window_s
         tail_time = time_s[tail]
         tail_voltage = voltage_v[tail]
+        
 
+        # Fit the voltage slope only when at least three samples and two distinct timestamps are available.
         slope = np.nan
         if len(tail_time) >= 3 and np.ptp(tail_time) > 0:
             slope = float(np.polyfit(tail_time - tail_time[0], tail_voltage, 1)[0] * 1000.0 * 60.0)
@@ -205,7 +209,19 @@ def _screen_ocv_points(
     voltage_column: str,
     current_column: str,
 ) -> pd.DataFrame:
+
+    """Evaluate extracted OCV points against quality criteria.
+    
+    Each quality check is stored as a qc_* flag. The function also adds an overall validity flag
+    and records the reasons for failed checks.
+    
+    All input points are retained. Failed points are annotated rather than removed.
+    """
+
+    # Work on a copy so QC annotations do not modify the input table.
     result = points.copy()
+
+    # Convert relevant columns to numeric values for consistent QC checks.
     soc = pd.to_numeric(result[soc_column], errors="coerce")
     voltage = pd.to_numeric(result[voltage_column], errors="coerce")
     current = pd.to_numeric(result[current_column], errors="coerce")
@@ -215,6 +231,7 @@ def _screen_ocv_points(
     tail_span = pd.to_numeric(result["tail_voltage_span_mV"], errors="coerce")
     tail_slope = pd.to_numeric(result["tail_voltage_slope_mV_per_min"], errors="coerce")
 
+    # Define the failure condition for each quality criterion. 
     checks = {
         "soc_missing_or_outside_0_1": ~np.isfinite(soc) | ~soc.between(0.0, 1.0, inclusive="both"),
         "voltage_missing": ~np.isfinite(voltage),
@@ -228,12 +245,18 @@ def _screen_ocv_points(
         ),
         "unknown_direction": ~result["direction"].isin({"charge", "discharge"}),
     }
+
+    # Store each failed quality check as a separate qc_* flag.
     for name, failed in checks.items():
         result[f"qc_{name}"] = failed
 
     qc_columns = [f"qc_{name}" for name in checks]
+
+    # A point is valid only if none of the quality checks has failed.
     result["is_valid_for_ocv"] = ~result[qc_columns].any(axis=1)
     reason_by_column = {f"qc_{name}": name for name in checks}
+
+    # Record all failed checks as exclusion reasons for traceability.
     result["exclusion_reason"] = result.apply(
         lambda row: ";".join(reason for column, reason in reason_by_column.items() if bool(row[column])),
         axis=1,
