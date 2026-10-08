@@ -300,7 +300,7 @@ def test_create_ocv_curves_uses_custom_and_fallback_labels(
         curve_labels={
             1: "Initial state",
         },
-        legend_title="Alterungszustand",
+        legend_title="Ageing state",
     )
 
     figure_numbers = plt.get_fignums()
@@ -327,7 +327,7 @@ def test_create_ocv_curves_uses_custom_and_fallback_labels(
         "iOCV block 2",
     }
     assert legend_titles == {
-        "Alterungszustand",
+        "Ageing state",
     }
 
     plt.close("all")
