@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import warnings
 from collections.abc import Mapping
 
 import matplotlib.pyplot as plt
@@ -92,7 +91,7 @@ def fit_ocv_soc_curve(
     if points.empty:
         raise ValueError("No finite OCV points within the normalized SOC range [0, 1].")
 
-    # Group OCV point into SOC bins and calculate robust voltage statistics.
+    # Group OCV points into SOC bins and calculate robust voltage statistics.
     edges = np.arange(0.0, 1.0, bin_width)
     edges = np.append(edges, 1.0)
     edges = np.unique(np.clip(edges, 0.0, 1.0))
@@ -125,12 +124,17 @@ def fit_ocv_soc_curve(
         binned["n"].to_numpy(float),
     )
 
-    # Build and evalute the PCHIP curve over the observed SOC range.
+    # Build and evaluate the PCHIP curve over the observed SOC range.
     soc = binned["SOC"].to_numpy(float)
     voltage = binned["ocv_monotonic_V"].to_numpy(float)
     grid = np.arange(soc.min(), soc.max() + grid_step * 0.5, grid_step)
-    grid = grid[grid <= soc.max() + np.finfo(float).eps * 8]
-    if grid[-1] < soc.max() - np.finfo(float).eps * 8:
+    tolerance = (np.finfo(float).eps * max(1.0, abs(float(soc.max()))) * 8)
+    grid = grid[grid <= soc.max() + tolerance]
+
+    # Snap values affected by floating-point rounding to the exact endpoint.
+    grid[np.abs(grid - soc.max()) <= tolerance] = soc.max()
+    grid = grid[grid <= soc.max()]
+    if grid[-1] < soc.max():
         grid = np.append(grid, soc.max())
 
     curve = pd.DataFrame(
@@ -265,67 +269,111 @@ def _screen_ocv_points(
 
 
 def _plot_ocv_curves(
-    points: pd.DataFrame,
     curves: pd.DataFrame,
-    soc_column: str,
-    voltage_column: str,
+    direction: str,
+    curve_labels: Mapping[int, str] | None = None,
+    legend_title: str | None = None,
 ) -> None:
-    """Show screened points and fitted curves separately for each iOCV block."""
-    block_ids = points["ocv_block_id"].drop_duplicates().tolist()
-    ncols = min(2, len(block_ids))
-    nrows = (len(block_ids) + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), squeeze=False)
-    styles = {"charge": ("#0072B2", "-"), "discharge": ("#D55E00", "--")}
+    """Plot fitted OCV-SOC curves for one measurement direction.
+    
+    User-defined legend labels can be provided for each OCV block.
+    Otherwise, the ocv_block_id is used.
+    Measurement specific ageing information is not inferred from the curve data.
+    """
 
-    for ax, block_id in zip(axes.flat, block_ids, strict=False):
-        block_points = points.loc[points["ocv_block_id"].eq(block_id)]
-        block_curves = curves.loc[curves["ocv_block_id"].eq(block_id)]
-        for direction, group in block_points.groupby("direction", sort=True):
-            color, linestyle = styles.get(direction, ("#777777", ":"))
-            soc = pd.to_numeric(group[soc_column], errors="coerce")
-            voltage = pd.to_numeric(group[voltage_column], errors="coerce")
-            finite = np.isfinite(soc) & np.isfinite(voltage)
-            kept = finite & group["is_valid_for_ocv"]
-            excluded = finite & ~group["is_valid_for_ocv"]
-            if kept.any():
-                ax.scatter(
-                    soc.loc[kept],
-                    voltage.loc[kept],
-                    facecolors="none",
-                    edgecolors=color,
-                    s=24,
-                    label=f"{direction.capitalize()} kept points",
-                    zorder=3,
-                )
-            if excluded.any():
-                ax.scatter(
-                    soc.loc[excluded],
-                    voltage.loc[excluded],
-                    color="#777777",
-                    marker="x",
-                    s=32,
-                    label=f"{direction.capitalize()} excluded points",
-                    zorder=3,
-                )
-            fitted = block_curves.loc[block_curves["direction"].eq(direction)].sort_values("SOC")
-            if not fitted.empty:
-                ax.plot(
-                    fitted["SOC"],
-                    fitted["OCV[V]"],
-                    color=color,
-                    linestyle=linestyle,
-                    linewidth=1.8,
-                    label=f"{direction.capitalize()} fit",
-                )
-        ax.set_title(f"iOCV block {block_id}")
-        ax.set_xlabel("SOC")
-        ax.set_ylabel("OCV [V]")
-        ax.grid(True, linestyle="--", alpha=0.3)
-        ax.legend(frameon=False)
+    if direction not in {"charge", "discharge"}:
+        raise ValueError(
+            "direction must be either 'charge' or 'discharge'."
+        )
 
-    for ax in axes.flat[len(block_ids) :]:
-        ax.set_visible(False)
-    fig.tight_layout()
+    selected = curves.loc[
+        curves["direction"].eq(direction)
+    ].copy()
+
+    if selected.empty:
+        raise ValueError(
+            f"No fitted {direction} curves are available."
+        )
+
+    block_ids = sorted(
+        selected["ocv_block_id"]
+        .drop_duplicates()
+        .tolist()
+    )
+    
+    count = len(block_ids)
+    colors = plt.get_cmap("cividis")(
+        np.linspace(
+            0.12,
+            0.88,
+            max(count, 2),
+        )
+    )[:count]
+
+    fig, ax = plt.subplots(
+        figsize=(8.2, 4.6),
+        constrained_layout=False,
+    )
+
+    # Plot only the fitted curves; raw and excluded points are omitted.
+    for color, block_id in zip(
+        colors,
+        block_ids,
+    ):
+        block_id = int(block_id)
+        
+        curve = selected.loc[
+            selected["ocv_block_id"].eq(block_id)
+        ].sort_values("SOC")
+
+        if curve.empty:
+            continue
+
+        # Use a caller-provided measurement state label when available.
+        # Otherwise, fall back to the automatically assigned iOCV block number.
+        label = (
+            curve_labels.get(block_id)
+            if curve_labels is not None
+            else None
+        )
+
+        if label is None or not str(label).strip():
+            label = f"iOCV block {block_id}"
+
+        ax.plot(
+            curve["SOC"].to_numpy(dtype=float) * 100.0,
+            curve["OCV[V]"].to_numpy(dtype=float),
+            color=color,
+            linewidth=1.45,
+            label=str(label),
+        )
+
+    ax.set_xlabel("SOC [%]")
+    ax.set_ylabel("OCV [V]")
+    ax.set_xlim(0, 100)
+
+    ax.grid(
+        axis="both",
+        color="#D9D9D9",
+        linewidth=0.55,
+        alpha=0.75,
+    )
+
+    ax.legend(
+        title=legend_title,
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        borderaxespad=0.0,
+        frameon=False,
+    )
+
+    fig.subplots_adjust(
+        left=0.10,
+        right=0.68,
+        bottom=0.14,
+        top=0.94,
+    )
+
     plt.show()
 
 
@@ -346,18 +394,17 @@ def create_ocv_curves(
     current_column: str = "Current[A]",
     time_column: str = "Test_Time[s]",
     visualize: bool = False,
+    curve_labels: Mapping[int, str] | None = None,
+    legend_title: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Quality-screen iOCV blocks and build separate charge/discharge curves.
+    """Build quality-screened charge and discharge OCV-SOC curves.
 
-    The input blocks are the output of :func:`extract_ocv_iocv`. For every
-    block, the function measures voltage stability over the end of each rest,
-    applies configurable point-level quality checks, and fits a monotonic
-    OCV-SOC curve to the remaining points with :func:`fit_ocv_soc_curve`.
-
-    Returns the screened points, SOC-bin statistics, and interpolated curves.
-    Every output retains ``ocv_block_id`` and ``direction`` so charge,
-    discharge, and separate iOCV check-ups are never mixed.
+    Each iOCV blocks is screened using rest-end stability metrics and
+    fitted separately by direction. Intermediate QC and binning results
+    are returned together with the fitted curves.
     """
+
+    # Validate input data and quality-control parameters.
     if not isinstance(ocv_blocks, list) or not ocv_blocks:
         raise ValueError("ocv_blocks must be a non-empty list of DataFrames.")
     if not isinstance(df_primitives, pd.DataFrame):
@@ -380,6 +427,7 @@ def create_ocv_curves(
     if not isinstance(min_tail_samples, int) or min_tail_samples < 1:
         raise ValueError("min_tail_samples must be a positive integer.")
 
+    # Validate the required columns in primitive data and OCV blocks.
     required_primitive_columns = {"ID", "Type", time_column, voltage_column}
     missing_primitives = sorted(required_primitive_columns - set(df_primitives.columns))
     if missing_primitives:
@@ -387,6 +435,8 @@ def create_ocv_curves(
 
     required_point_columns = {"ID", "iOCV_type", soc_column, voltage_column, current_column}
     prepared_blocks: list[pd.DataFrame] = []
+
+    #Assign a block id and normalize the charge/discharge direction.
     for block_id, block in enumerate(ocv_blocks, start=1):
         if not isinstance(block, pd.DataFrame) or block.empty:
             raise ValueError(f"OCV block {block_id} must be a non-empty DataFrame.")
@@ -398,6 +448,7 @@ def create_ocv_curves(
         prepared["direction"] = prepared["iOCV_type"].astype("string").str.lower().fillna("unknown")
         prepared_blocks.append(prepared)
 
+    # Combine all blocks and attach rest-end stability metrics.
     points = pd.concat(prepared_blocks, ignore_index=True)
     metrics = _rest_quality_metrics(
         df_primitives=df_primitives,
@@ -407,6 +458,8 @@ def create_ocv_curves(
         voltage_column=voltage_column,
     )
     points = points.merge(metrics, on="ID", how="left", validate="many_to_one")
+
+    # Apply point-level quality screening without removing failed points.
     points = _screen_ocv_points(
         points=points,
         min_rest_duration_s=min_rest_duration_s,
@@ -420,6 +473,7 @@ def create_ocv_curves(
         current_column=current_column,
     )
 
+    # Fit each OCV block and direction separately using only valid points.
     binned_parts: list[pd.DataFrame] = []
     curve_parts: list[pd.DataFrame] = []
     for (block_id, direction), group in points.groupby(["ocv_block_id", "direction"], sort=True):
@@ -440,8 +494,25 @@ def create_ocv_curves(
         binned_parts.append(binned)
         curve_parts.append(curve)
 
-    return (
-        points,
-        pd.concat(binned_parts, ignore_index=True),
-        pd.concat(curve_parts, ignore_index=True),
+    # COmbine fitted results from all blocks and directions.
+    binned_results = pd.concat(
+        binned_parts,
+        ignore_index=True,
     )
+    curves = pd.concat(
+        curve_parts,
+        ignore_index=True,
+    )
+
+    # Optionally plot the fitted charge and discharge curves.
+    if visualize:
+        for direction in ("charge", "discharge"):
+            if curves["direction"].eq(direction).any():
+                _plot_ocv_curves(
+                    curves=curves,
+                    direction=direction,
+                    curve_labels=curve_labels,
+                    legend_title=legend_title,
+                )
+
+    return points, binned_results, curves
