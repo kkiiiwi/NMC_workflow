@@ -1,4 +1,16 @@
-"""Extract pulse and rest information from user-supplied HPPC blocks."""
+"""Segment HPPC measurement data by current state.
+    
+    This module identifies consecutive positive current, negative current,
+    and rest segments in preidentified HPPC measurement data. It supports
+    batch-wise processing and extracts segment-level statictics, including
+    duration, current, voltage, and SOC information.
+    
+    The module also provides a helper to locate current transitions near
+    nominal pulse start and stop times.
+    
+    It does not identify HPPC protocols or calculate higher level HPPC
+    parameters such as a pulse resistance or power capacity.
+    """
 
 from __future__ import annotations
 
@@ -163,7 +175,7 @@ def _merge_segment(
 
     finished = active
 
-    # Use the next segment start to determine the complete duration of the
+    # Use the next segment's start time as the end boundary of the
     # preceding segment when both belong to the same TestIndex.
     if float(active["TestIndex"]) == float(segment["TestIndex"]):
         finished["duration_s"] = max(
@@ -186,11 +198,14 @@ def _finalize_run(
 ) -> dict[str, float | int | str]:
     """Calculate final statistics for one current-state segment."""
 
+    # Prevent division by zero if the sample count is unexpectedly zero.
     n_samples = max(
         1,
         int(run["n_samples"]),
     )
     mean_current_A = float(run["current_sum"]) / n_samples
+
+    # Clip small negative variance values caused by flooting-point errors.
     variance = max(
         0.0,
         float(run["current_sumsq"]) / n_samples - mean_current_A**2,
@@ -251,8 +266,26 @@ def extract_current_segments(
 
     The caller must provide data that has already been identified as an HPPC block.
     This function does not infer the measurement protocol.
+
+    Parameters
+    ----------
+    df: pd. DataFrame
+        Input HPPC measurement data.
+    cell_id: str
+        Identifier or the battery cell.
+    current_threshold_A: float, default 0.05
+        Absolute current threshold used to classify rest states.
+    batch_size: int, default 500_000
+        Number of input rows processed per batch.
+
+    Returns
+    -------
+    pd. DateFrame
+        Segment-level statistics, including current state, duration,
+        current statistics, boundary voltages, and SOC information.
     """
 
+    # Validate input data and parameters before processing.
     if not isinstance(df, pd.DataFrame):
         raise ValueError("df must be a pandas DataFrame.")
 
@@ -275,7 +308,9 @@ def extract_current_segments(
         raise ValueError("current_threshold_A must be greater than 0.")
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1.")
+    
 
+    # Select only the required measurement columns to limit memory usgae.
     columns = [
         "TestIndex",
         "Test_Time[s]",
@@ -288,6 +323,8 @@ def extract_current_segments(
 
     data = df[columns].copy()
 
+    # Convert measurement values to numeric types, treating invalid
+    # values and missing SOC data as NaN.
     for column in [
         "TestIndex",
         "Test_Time[s]",
@@ -311,6 +348,9 @@ def extract_current_segments(
     rows: list[dict[str, float | int | str]] = []
     run_counter: defaultdict[float, int] = defaultdict(int)
 
+
+    # Process data in batches to limit temporary memory usage.
+    # Segement continuity is maintained across batch boundaried.
     for start in range(
         0,
         len(data),
@@ -339,6 +379,8 @@ def extract_current_segments(
                 segment,
             )
 
+            # Finalize a segment when it can no longer be merged
+            # with the next segment.
             if finished is not None:
                 test_index_value = float(finished["TestIndex"])
                 run_counter[test_index_value] += 1
@@ -350,6 +392,8 @@ def extract_current_segments(
                     )
                 )
 
+    # Finalize the last active segment, which has no subsequent
+    # segment to trigger its completion.
     if active is not None:
         test_index_value = float(active["TestIndex"])
         run_counter[test_index_value] += 1
@@ -374,7 +418,37 @@ def _event_target_position(
     search_after_s: float = 5.0,
     min_current_step_A: float = 0.5,
 ) -> int | None:
-    """Locate the actual current transition near a nominal pulse event."""
+    """Locate the actual current transition near a nominal pulse event.
+    
+    Search for significant current changes near the cexpected pulse
+    start or stop time. A valid transition must move toward the pulse
+    current at the start, or away from it at the stop.
+    
+    The input time array must be sorted in ascending order.
+    
+    Parameters
+    ----------
+    time_s: np.ndarray
+        Measurement timestamps in seconds.
+    current_A: np.ndarray
+        Measured current values in amperes.
+    event_kind: str
+        Event type, either "start" or "stop".
+    pulse_current_A: float
+        Reference current of the pulse in amperes. 
+    search_before_s: float, default 1.0
+        Search window before the nominal event time in seconds.
+    search_after_s: float, default 5.0
+        Search window after the nominal event time in seconds.
+    min_current_step_A: float, default 0.5
+        Minimum absolute current change required for a valid transition.
+        
+    Returns
+    -------
+    int or None
+        Index of the nearest matching current transition, or None
+        if no valid transition is found.
+    """
 
     if event_kind not in {"start", "stop"}:
         raise ValueError(
