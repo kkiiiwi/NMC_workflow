@@ -1,4 +1,17 @@
-"""Fit second-order RC equivalent-circuit models to battery pulse data."""
+"""Fit second-order RC equivalent-circuit models to battery pulse data.
+
+This module extracts pulse and rest windows from user-supplied HPPC
+measurement blocks and estimates the parameters of a second-order RC
+equivalent-circuit model.
+
+The extracted parameters include the ohmic resistance R0, polarization
+resistances R1 and R2, time constants tau1 and tau2, and capacitances C1
+and C2. Fit-quality metrics and measured-versus-fitted recovery curves
+are also returned for validation.
+
+The input data must already be identified as HPPC measurement data.
+This module performs parameter estimation but does not plot the results.
+"""
 
 from __future__ import annotations
 
@@ -48,6 +61,8 @@ class LoadRestWindow:
 def select_fit_positions(time_s: np.ndarray) -> np.ndarray:
     """Subsample long rest periods without losing the fast early dynamics."""
 
+    # Retain dense sampling immediately after the pulse, where the voltage
+    # changes rapidly, and progressively reduce sampling at later times.
     masks = [
         time_s <= 5.0,
         (time_s > 5.0) & (time_s <= 30.0),
@@ -66,6 +81,7 @@ def select_fit_positions(time_s: np.ndarray) -> np.ndarray:
         positions = np.flatnonzero(mask)
         selected.append(positions[::stride])
 
+    # Always include the final sample to capture the long-term recovery level.
     selected.append(
         np.array(
             [len(time_s) - 1],
@@ -88,12 +104,20 @@ def extract_rest_window(
     ]
     | None
 ):
-    """Extract the complete rest period following one current pulse."""
+    """Extract the complete rest period following one current pulse.
+    
+    Locate the actual pulse end and extract the subsequent rest period
+    until the next current activity or the end of the HPPC block.
+    
+    Return the relative time, direction-normalized voltage recovery,
+    and summary metadata, or None if no valid rest window is found.
+    """
 
     time_s = raw["Test_Time[s]"].to_numpy(dtype=float)
     current_A = raw["Current[A]"].to_numpy(dtype=float)
     voltage_V = raw["Voltage[V]"].to_numpy(dtype=float)
 
+    # Locate the measured current transition at the end of the pulse.
     stop_position = _event_target_position(
         time_s=time_s,
         current_A=current_A,
@@ -105,6 +129,9 @@ def extract_rest_window(
     if stop_position is None:
         return None
 
+    
+    # The rest window continues until the next non-rest current segement
+    # or until the end of the supplied HPPC block.
     future_active = np.flatnonzero(np.abs(current_A[stop_position + 1 :]) > current_threshold_A)
     rest_end = stop_position + 1 + int(future_active[0]) if len(future_active) else len(raw)
 
@@ -115,6 +142,9 @@ def extract_rest_window(
     rest_voltage_V = voltage_V[stop_position:rest_end]
     shifted_time_s = rest_time_s - rest_time_s[0]
 
+
+    # Normalize the recovery direction so that charge and discharge
+    # pulse can be fitted using the same positive recovery model.
     direction_sign = 1.0 if str(pulse["pulse_direction"]) == "discharge" else -1.0
     recovery_V = direction_sign * (rest_voltage_V - rest_voltage_V[0])
 
@@ -124,6 +154,8 @@ def extract_rest_window(
         "rest_duration_s": float(shifted_time_s[-1]),
         "rest_raw_sample_count": int(len(shifted_time_s)),
         "rest_dt_median_s": float(np.median(np.diff(shifted_time_s))),
+
+        # Use the median of the final samples to reduce sensitivity to noise.
         "recovery_final_V": float(
             np.median(
                 recovery_V[
@@ -159,6 +191,7 @@ def extract_load_and_rest_window(
     voltage_V = raw["Voltage[V]"].to_numpy(dtype=float)
     pulse_current_A = float(pulse["mean_current_A"])
 
+    # Locate the actual pulse start and stop transitions in the raw data.
     start_position = _event_target_position(
         time_s=time_s,
         current_A=current_A,
@@ -177,12 +210,16 @@ def extract_load_and_rest_window(
     if start_position is None or stop_position is None or stop_position <= start_position + 2:
         return None
 
+    # End the rest window at the next active-current sample
+    # or at the end of the supplied HPPC block.
     future_active = np.flatnonzero(np.abs(current_A[stop_position + 1 :]) > current_threshold_A)
     rest_end = stop_position + 1 + int(future_active[0]) if len(future_active) else len(raw)
 
     if rest_end - stop_position < 10:
         return None
 
+    # Search backward from the pulse start to identify the preceding
+    # continuous rest period.
     pre_end = start_position - 1
     pre_start = pre_end
 
@@ -190,6 +227,9 @@ def extract_load_and_rest_window(
         pre_start -= 1
 
     pre_rest_duration_s = float(time_s[pre_end] - time_s[pre_start])
+
+    # Estimate the pre-pulse OCV from up to the final 30 seconds
+    # of the preceding rest period, using the median to reduce noise.
     pre_tail_mask = (
         time_s
         >= max(
@@ -203,6 +243,8 @@ def extract_load_and_rest_window(
 
     ocv_before_V = float(np.median(voltage_V[pre_tail_mask]))
 
+    # Extract the pulse  and following rest as a single measurement window,
+    # using the pulse start as the local time origin.
     selection = slice(
         start_position,
         rest_end,
@@ -228,6 +270,8 @@ def extract_load_and_rest_window(
     if len(pulse_positions) < 3 or len(rest_positions) < 10:
         return None
 
+    # Estimate the post-pulse OCV from up to the final 30 seconds
+    # of the rest period, using the median to reduce noise.
     rest_time_s = local_time_s[rest_positions] - local_time_s[rest_positions[0]]
     rest_duration_s = float(rest_time_s[-1])
     tail_start_s = max(
@@ -237,6 +281,8 @@ def extract_load_and_rest_window(
     tail_positions = rest_positions[rest_time_s >= tail_start_s]
     ocv_after_V = float(np.median(window_voltage_V[tail_positions]))
 
+    # Integrate the measured current over time to estimate cumulative
+    # charge throughput during the pulse and subsequent rest.
     cumulative_charge_As = np.zeros(
         len(local_time_s),
         dtype=float,
@@ -244,6 +290,8 @@ def extract_load_and_rest_window(
     if len(local_time_s) > 1:
         cumulative_charge_As[1:] = np.cumsum(window_current_A[:-1] * np.diff(local_time_s))
 
+    # Interpolate the OCV between pre- and post-pulse estimates using
+    # the fraction of charge transferred, keeping it constant during rest.
     pulse_charge_As = float(cumulative_charge_As[local_stop])
     if abs(pulse_charge_As) < 1e-9:
         return None
@@ -256,6 +304,8 @@ def extract_load_and_rest_window(
     ocv_fraction[rest_positions] = 1.0
     ocv_path_V = ocv_before_V + (ocv_after_V - ocv_before_V) * ocv_fraction
 
+    # Select pulse and subsampled rest points for joint fitting,
+    # excluding the first 0.5 seconds of each phase.
     load_fit_positions = pulse_positions[local_time_s[pulse_positions] >= 0.5]
     selected_rest = select_fit_positions(rest_time_s)
     selected_rest = selected_rest[rest_time_s[selected_rest] >= 0.5]
@@ -305,6 +355,8 @@ def unpack_parameters(
 ) -> tuple[float, float, float, float]:
     """Transform logarithmic parameters into positive model parameters."""
 
+    # Use exponential transforms to ensure positive parameters and
+    # enforce tau2 > tau1 through a positive time-constant gap.
     amplitude_1 = float(np.exp(parameters[0]))
     amplitude_2 = float(np.exp(parameters[1]))
     tau_1 = float(np.exp(parameters[2]))
@@ -349,13 +401,22 @@ def initial_guesses(
     rest_duration_s: float,
     profile: str = "full",
 ) -> list[np.ndarray]:
-    """Generate initial parameter guesses for the nonlinear fit."""
+    """Generate initial parameter guesses for the nonlinear fit.
+    
+    Use predefined amplitude splits and time-constant pairs to generate
+    multiple starting points. Guesses are expressed in log space to ensure
+    positive parameters and ordered time constants.
+    """
 
+    # Apply a positive lower bound to the recovery amplitude
+    # to avoid invalid logarithms when generating initial guesses.
     total = max(
         float(final_recovery_V),
         2e-4,
     )
 
+    # Use a reduced set of amplitude splits and time constants
+    # to limit the computational cost of batch fitting.
     if profile == "batch":
         batch_specs = [
             (0.50, 1.0, 25.0),
@@ -398,6 +459,8 @@ def initial_guesses(
     if profile != "full":
         raise ValueError(f"Unknown initial-guess profile: {profile}")
 
+    # Explore a wider range of time-constant pairs and amplitude
+    # splits to reduce sensitivity to initial parameter estimates.
     tau_pairs = [
         (0.3, 5.0),
         (0.5, 20.0),
@@ -425,7 +488,9 @@ def initial_guesses(
         for tau_1, tau_2 in tau_pairs:
             if tau_2 <= tau_1:
                 continue
-
+            
+            # Express initial guesses in log space, using the positive
+            # time-constant gap to preserve tau2 > tau1.
             guesses.append(
                 np.array(
                     [
@@ -458,10 +523,15 @@ def fit_rest_window(
 ) -> tuple[dict[str, object], np.ndarray]:
     """Fit a second-order RC model to a measured voltage recovery."""
 
+
+    # Subsample the recovery data while retaining dense early time
+    # measurements to capture the first RC response.
     fit_positions = select_fit_positions(time_s)
     fit_time = time_s[fit_positions]
     fit_recovery = recovery_V[fit_positions]
 
+    # Estimate the final recovery amplitude from the final samples,
+    # using the median to reduce sensitivity to noise and outliers.
     final_recovery = float(
         np.median(
             recovery_V[
@@ -473,6 +543,8 @@ def fit_rest_window(
         )
     )
 
+    # Define optimization bounds in log space to constrain the
+    # recovery amplitudes and time constants to positive ranges.
     lower = np.log(
         np.array(
             [
@@ -504,6 +576,8 @@ def fit_rest_window(
         )
     )
 
+    # Fit from multiple initial guesses and retain the solution
+    # with the lowest robust least-squares cost.
     best = None
 
     for guess in initial_guesses(
@@ -528,6 +602,8 @@ def fit_rest_window(
                 lower,
                 upper,
             ),
+
+            # Reduce the influence of isolated voltage outliers.
             loss="soft_l1",
             f_scale=2e-4,
             max_nfev=5000,
@@ -546,6 +622,8 @@ def fit_rest_window(
         tau_2,
     ) = unpack_parameters(best.x)
 
+    # Evaluate the fitted model over the full recovery window,
+    # including samples excluded from the optimization.
     predicted = recovery_model(
         time_s,
         amplitude_1,
@@ -564,6 +642,7 @@ def fit_rest_window(
 
     r_squared = float(1.0 - np.sum(residual**2) / denominator) if denominator > 0 else np.nan
 
+    # A large condition number indicates weak parameter identifiability.
     try:
         jacobian_condition = float(np.linalg.cond(best.jac.T @ best.jac))
     except np.linalg.LinAlgError:
@@ -594,6 +673,8 @@ def unpack_direct_rc_parameters(
 ) -> tuple[float, float, float, float]:
     """Return positive RC parameters with ordered time constants."""
 
+    # Enforce positive resistances and ordered time constants
+    # through the Logarithmic parameterization.
     resistance_1 = float(np.exp(parameters[0]))
     resistance_2 = float(np.exp(parameters[1]))
     tau_1 = float(np.exp(parameters[2]))
@@ -626,12 +707,15 @@ def simulate_load_and_rest(
         dtype=float,
     )
 
+    # Assume zero initial polarization voltage in both RC branches.
     voltage_rc_1 = 0.0
     voltage_rc_2 = 0.0
 
     for index in range(len(window.time_s)):
         current = float(window.current_A[index])
 
+        # Combine the estimated OCV, ohmic voltage contribution,
+        # and the two RC polarization voltages.
         predicted[index] = float(window.ocv_path_V[index]) + resistance_0_ohm * current + voltage_rc_1 + voltage_rc_2
 
         if index + 1 >= len(window.time_s):
@@ -642,6 +726,8 @@ def simulate_load_and_rest(
         if dt <= 0:
             continue
 
+        # Update the RC states using exponential decay over the actual
+        # sampling interval to accommodate irregular time steps.
         decay_1 = float(np.exp(-dt / tau_1))
         decay_2 = float(np.exp(-dt / tau_2))
 
@@ -659,6 +745,8 @@ def fit_load_and_rest_window(
 ) -> tuple[dict[str, object], np.ndarray]:
     """Fit R1, R2, tau1, and tau2 to a load-and-rest window."""
 
+    # Minimize the difference between simulated and measured voltages
+    # at the selected pulse and rest samples.
     def residual(
         parameters: np.ndarray,
     ) -> np.ndarray:
@@ -684,6 +772,8 @@ def fit_load_and_rest_window(
         10.0 * window.rest_duration_s,
     )
 
+    # Set parameter bounds based on the measurement time resolution
+    # and the available rest duration.
     lower = np.log(
         np.array(
             [
@@ -709,6 +799,9 @@ def fit_load_and_rest_window(
 
     resistance_1, resistance_2, tau_1, tau_2 = initial_rc
 
+
+    # Perturb the initial RC estimates to improve the robustness
+    # of the nonlinear optimization.
     seeds = [
         (
             resistance_1,
@@ -828,6 +921,8 @@ def fit_load_and_rest_window(
             "R_squared": (float(1.0 - np.sum(values**2) / denominator) if denominator > 0 else np.nan),
         }
 
+    # Evalute fit quality separately for the pulse, rest,
+    # and combined measurement windows.
     overall = metrics(overall_eval)
     load = metrics(load_eval)
     rest = metrics(rest_eval)
@@ -840,6 +935,8 @@ def fit_load_and_rest_window(
     pulse_current = float(np.median(window.current_A[window.pulse_positions]))
     pulse_duration = window.pulse_duration_actual_s
 
+    # Derive the pulse-induced relaxation amplitudes from the fitted
+    # RC parameters and measured pulse duration.
     amplitude_1 = abs(pulse_current) * resistance_1 * (1.0 - np.exp(-pulse_duration / tau_1))
     amplitude_2 = abs(pulse_current) * resistance_2 * (1.0 - np.exp(-pulse_duration / tau_2))
 
@@ -992,6 +1089,8 @@ def fit_ecm_pulse(
         )
         return row, None
 
+    # Convert the fitted recovery amplitudes into initial polarization
+    # resistance estimates using pulse current and duration.
     seed_r1_ohm = float(relaxation_fit["amplitude_1_V"]) / denominator_1
     seed_r2_ohm = float(relaxation_fit["amplitude_2_V"]) / denominator_2
 
@@ -1046,6 +1145,8 @@ def fit_ecm_pulse(
         dtype=float,
     )
 
+    # Mark the fit as valid only if optimization succeeds and the 
+    # estimated RC parameters are finite, positive, and ordered.
     row["fit_valid"] = bool(
         row["optimizer_success"]
         and np.isfinite(required_parameters).all()
@@ -1125,6 +1226,8 @@ def create_ecm_parameters(
         following_state = segments["state"].shift(-1)
         following_test_index = segments["TestIndex"].shift(-1)
 
+        # Identify pulse candidates as non-rest segments immediately
+        # followed by rest within the same TextIndex.
         pulse_mask = segments["state"].ne(0) & following_state.eq(0) & segments["TestIndex"].eq(following_test_index)
 
         pulse_segments = segments.loc[pulse_mask]
@@ -1147,6 +1250,8 @@ def create_ecm_parameters(
             test_index = float(segment["TestIndex"])
             raw_test = raw.loc[numeric_test_index.eq(test_index)].copy()
 
+            # Fit each pulse independently using measurements from
+            # its corresponding TestIndex.
             result, curve = fit_ecm_pulse(
                 raw=raw_test,
                 pulse=pulse,
@@ -1157,6 +1262,8 @@ def create_ecm_parameters(
 
             result["hppc_block_id"] = block_id
 
+            # Preserve user-supplied block metadata without overwriting
+            # existing fit results.
             for key, value in block_info.items():
                 if key not in result:
                     result[key] = value
@@ -1176,7 +1283,14 @@ def calculate_pulse_r0(
     pulse: pd.Series,
     config: _BatteryConfigClass,
 ) -> dict[str, float | str | bool]:
-    """Calculate R0 at the start and stop of one current pulse."""
+    """Calculate R0 at the start and stop of one current pulse.
+    
+    The internal resistance calculation is delegated to
+    
+    "add_resistance_internal". This function locates the pulse-start and
+    pulse-stop transistions, extracts their resistance values, and selects
+    the pulse-stop value with the pulse-start values as a fallback.
+    """
 
     required_columns = [
         "Test_Time[s]",
@@ -1195,6 +1309,7 @@ def calculate_pulse_r0(
     current_A = work["Current[A]"].to_numpy(dtype=float)
     pulse_current_A = float(pulse["mean_current_A"])
 
+    # Locate the measured current transitions at the pulse start and stop.
     start_position = _event_target_position(
         time_s=time_s,
         current_A=current_A,
@@ -1210,6 +1325,8 @@ def calculate_pulse_r0(
         pulse_current_A=pulse_current_A,
     )
 
+    # Reuse the existing PyDPEET resistance calculation to obtain
+    # internal resistance estimates at the detected pulse transistions.
     calculated = add_resistance_internal(
         work,
         config=config,
@@ -1228,6 +1345,8 @@ def calculate_pulse_r0(
     r0_start_ohm = resistance_at(start_position)
     r0_stop_ohm = resistance_at(stop_position)
 
+    # Prefer a valid resistance estimate at pulse stop, falling
+    # back to the pulse-start estimate when neccessary.
     if np.isfinite(r0_stop_ohm) and r0_stop_ohm > 0:
         r0_ohm = r0_stop_ohm
         r0_source = "stop"
