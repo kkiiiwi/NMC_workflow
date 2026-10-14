@@ -6,56 +6,30 @@ equivalent-circuit model.
 
 The extracted parameters include the ohmic resistance R0, polarization
 resistances R1 and R2, time constants tau1 and tau2, and capacitances C1
-and C2. Fit-quality metrics and measured-versus-fitted recovery curves
-are also returned for validation.
+and C2. Fit-quality metrics and quality flags are also returned for validation.
 
 The input data must already be identified as HPPC measurement data.
-This module performs parameter estimation but does not plot the results.
+Optional overview figures show the extracted parameters over SOC, FEC,
+and calendar age.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from scipy.optimize import least_squares
 
 from pydpeet.process.analyze.configs.battery_config import (
     _BatteryConfigClass,
-)
-from pydpeet.process.analyze.extract.hppc import _event_target_position, extract_current_segments
+    )
+from pydpeet.process.analyze.extract.hppc import (
+    _event_target_position,
+    )
 from pydpeet.process.analyze.resistance import (
     add_resistance_internal,
 )
 
-
-@dataclass
-class FitCurve:
-    """Measured and fitted voltage recovery for one pulse."""
-
-    pulse_row_id: int
-    time_s: np.ndarray
-    recovery_measured_V: np.ndarray
-    recovery_fitted_V: np.ndarray
-
-
-@dataclass
-class LoadRestWindow:
-    """Current, voltage, and OCV data for one pulse and subsequent rest."""
-
-    time_s: np.ndarray
-    current_A: np.ndarray
-    voltage_V: np.ndarray
-    ocv_path_V: np.ndarray
-    pulse_positions: np.ndarray
-    rest_positions: np.ndarray
-    fit_positions: np.ndarray
-    pre_rest_duration_s: float
-    pulse_duration_actual_s: float
-    rest_duration_s: float
-    ocv_before_V: float
-    ocv_after_V: float
 
 
 def select_fit_positions(time_s: np.ndarray) -> np.ndarray:
@@ -174,168 +148,6 @@ def extract_rest_window(
         metadata,
     )
 
-
-def extract_load_and_rest_window(
-    raw: pd.DataFrame,
-    pulse: pd.Series,
-    current_threshold_A: float = 0.05,
-) -> LoadRestWindow | None:
-    """Extract one measured current pulse and the complete following rest.
-
-    Durations are inferred from current transitions in the supplied HPPC
-    block. No nominal pulse or rest duration is assumed.
-    """
-
-    time_s = raw["Test_Time[s]"].to_numpy(dtype=float)
-    current_A = raw["Current[A]"].to_numpy(dtype=float)
-    voltage_V = raw["Voltage[V]"].to_numpy(dtype=float)
-    pulse_current_A = float(pulse["mean_current_A"])
-
-    # Locate the actual pulse start and stop transitions in the raw data.
-    start_position = _event_target_position(
-        time_s=time_s,
-        current_A=current_A,
-        event_time_s=float(pulse["pulse_start_time_s"]),
-        event_kind="start",
-        pulse_current_A=pulse_current_A,
-    )
-    stop_position = _event_target_position(
-        time_s=time_s,
-        current_A=current_A,
-        event_time_s=float(pulse["pulse_end_time_s"]),
-        event_kind="stop",
-        pulse_current_A=pulse_current_A,
-    )
-
-    if start_position is None or stop_position is None or stop_position <= start_position + 2:
-        return None
-
-    # End the rest window at the next active-current sample
-    # or at the end of the supplied HPPC block.
-    future_active = np.flatnonzero(np.abs(current_A[stop_position + 1 :]) > current_threshold_A)
-    rest_end = stop_position + 1 + int(future_active[0]) if len(future_active) else len(raw)
-
-    if rest_end - stop_position < 10:
-        return None
-
-    # Search backward from the pulse start to identify the preceding
-    # continuous rest period.
-    pre_end = start_position - 1
-    pre_start = pre_end
-
-    while pre_start > 0 and abs(current_A[pre_start - 1]) <= current_threshold_A:
-        pre_start -= 1
-
-    pre_rest_duration_s = float(time_s[pre_end] - time_s[pre_start])
-
-    # Estimate the pre-pulse OCV from up to the final 30 seconds
-    # of the preceding rest period, using the median to reduce noise.
-    pre_tail_mask = (
-        time_s
-        >= max(
-            time_s[pre_start],
-            time_s[start_position] - 30.0,
-        )
-    ) & (time_s < time_s[start_position])
-
-    if not np.any(pre_tail_mask):
-        return None
-
-    ocv_before_V = float(np.median(voltage_V[pre_tail_mask]))
-
-    # Extract the pulse  and following rest as a single measurement window,
-    # using the pulse start as the local time origin.
-    selection = slice(
-        start_position,
-        rest_end,
-    )
-    window_time_s = time_s[selection]
-    window_current_A = current_A[selection]
-    window_voltage_V = voltage_V[selection]
-
-    local_time_s = window_time_s - window_time_s[0]
-    local_stop = stop_position - start_position
-
-    pulse_positions = np.arange(
-        0,
-        local_stop,
-        dtype=int,
-    )
-    rest_positions = np.arange(
-        local_stop,
-        len(local_time_s),
-        dtype=int,
-    )
-
-    if len(pulse_positions) < 3 or len(rest_positions) < 10:
-        return None
-
-    # Estimate the post-pulse OCV from up to the final 30 seconds
-    # of the rest period, using the median to reduce noise.
-    rest_time_s = local_time_s[rest_positions] - local_time_s[rest_positions[0]]
-    rest_duration_s = float(rest_time_s[-1])
-    tail_start_s = max(
-        0.0,
-        rest_duration_s - 30.0,
-    )
-    tail_positions = rest_positions[rest_time_s >= tail_start_s]
-    ocv_after_V = float(np.median(window_voltage_V[tail_positions]))
-
-    # Integrate the measured current over time to estimate cumulative
-    # charge throughput during the pulse and subsequent rest.
-    cumulative_charge_As = np.zeros(
-        len(local_time_s),
-        dtype=float,
-    )
-    if len(local_time_s) > 1:
-        cumulative_charge_As[1:] = np.cumsum(window_current_A[:-1] * np.diff(local_time_s))
-
-    # Interpolate the OCV between pre- and post-pulse estimates using
-    # the fraction of charge transferred, keeping it constant during rest.
-    pulse_charge_As = float(cumulative_charge_As[local_stop])
-    if abs(pulse_charge_As) < 1e-9:
-        return None
-
-    ocv_fraction = np.clip(
-        cumulative_charge_As / pulse_charge_As,
-        0.0,
-        1.0,
-    )
-    ocv_fraction[rest_positions] = 1.0
-    ocv_path_V = ocv_before_V + (ocv_after_V - ocv_before_V) * ocv_fraction
-
-    # Select pulse and subsampled rest points for joint fitting,
-    # excluding the first 0.5 seconds of each phase.
-    load_fit_positions = pulse_positions[local_time_s[pulse_positions] >= 0.5]
-    selected_rest = select_fit_positions(rest_time_s)
-    selected_rest = selected_rest[rest_time_s[selected_rest] >= 0.5]
-    rest_fit_positions = rest_positions[selected_rest]
-    fit_positions = np.unique(
-        np.concatenate(
-            [
-                load_fit_positions,
-                rest_fit_positions,
-            ]
-        )
-    )
-
-    if len(fit_positions) < 12:
-        return None
-
-    return LoadRestWindow(
-        time_s=local_time_s,
-        current_A=window_current_A,
-        voltage_V=window_voltage_V,
-        ocv_path_V=ocv_path_V,
-        pulse_positions=pulse_positions,
-        rest_positions=rest_positions,
-        fit_positions=fit_positions,
-        pre_rest_duration_s=(pre_rest_duration_s),
-        pulse_duration_actual_s=float(time_s[stop_position] - time_s[start_position]),
-        rest_duration_s=rest_duration_s,
-        ocv_before_V=ocv_before_V,
-        ocv_after_V=ocv_after_V,
-    )
 
 
 def recovery_model(
@@ -668,322 +480,6 @@ def fit_rest_window(
     return result, predicted
 
 
-def unpack_direct_rc_parameters(
-    parameters: np.ndarray,
-) -> tuple[float, float, float, float]:
-    """Return positive RC parameters with ordered time constants."""
-
-    # Enforce positive resistances and ordered time constants
-    # through the Logarithmic parameterization.
-    resistance_1 = float(np.exp(parameters[0]))
-    resistance_2 = float(np.exp(parameters[1]))
-    tau_1 = float(np.exp(parameters[2]))
-    tau_2 = float(tau_1 + np.exp(parameters[3]))
-
-    return (
-        resistance_1,
-        resistance_2,
-        tau_1,
-        tau_2,
-    )
-
-
-def simulate_load_and_rest(
-    parameters: np.ndarray,
-    window: LoadRestWindow,
-    resistance_0_ohm: float,
-) -> np.ndarray:
-    """Simulate a measured, potentially irregular current time series."""
-
-    (
-        resistance_1,
-        resistance_2,
-        tau_1,
-        tau_2,
-    ) = unpack_direct_rc_parameters(parameters)
-
-    predicted = np.empty(
-        len(window.time_s),
-        dtype=float,
-    )
-
-    # Assume zero initial polarization voltage in both RC branches.
-    voltage_rc_1 = 0.0
-    voltage_rc_2 = 0.0
-
-    for index in range(len(window.time_s)):
-        current = float(window.current_A[index])
-
-        # Combine the estimated OCV, ohmic voltage contribution,
-        # and the two RC polarization voltages.
-        predicted[index] = float(window.ocv_path_V[index]) + resistance_0_ohm * current + voltage_rc_1 + voltage_rc_2
-
-        if index + 1 >= len(window.time_s):
-            continue
-
-        dt = float(window.time_s[index + 1] - window.time_s[index])
-
-        if dt <= 0:
-            continue
-
-        # Update the RC states using exponential decay over the actual
-        # sampling interval to accommodate irregular time steps.
-        decay_1 = float(np.exp(-dt / tau_1))
-        decay_2 = float(np.exp(-dt / tau_2))
-
-        voltage_rc_1 = decay_1 * voltage_rc_1 + resistance_1 * (1.0 - decay_1) * current
-
-        voltage_rc_2 = decay_2 * voltage_rc_2 + resistance_2 * (1.0 - decay_2) * current
-
-    return predicted
-
-
-def fit_load_and_rest_window(
-    window: LoadRestWindow,
-    resistance_0_ohm: float,
-    initial_rc: tuple[float, float, float, float],
-) -> tuple[dict[str, object], np.ndarray]:
-    """Fit R1, R2, tau1, and tau2 to a load-and-rest window."""
-
-    # Minimize the difference between simulated and measured voltages
-    # at the selected pulse and rest samples.
-    def residual(
-        parameters: np.ndarray,
-    ) -> np.ndarray:
-        predicted = simulate_load_and_rest(
-            parameters=parameters,
-            window=window,
-            resistance_0_ohm=resistance_0_ohm,
-        )
-
-        return predicted[window.fit_positions] - window.voltage_V[window.fit_positions]
-
-    median_dt = float(np.median(np.diff(window.time_s)))
-    minimum_tau = max(
-        0.05,
-        median_dt / 2.0,
-    )
-    maximum_tau_1 = max(
-        60.0,
-        window.rest_duration_s,
-    )
-    maximum_tau_gap = max(
-        6000.0,
-        10.0 * window.rest_duration_s,
-    )
-
-    # Set parameter bounds based on the measurement time resolution
-    # and the available rest duration.
-    lower = np.log(
-        np.array(
-            [
-                1e-6,
-                1e-6,
-                minimum_tau,
-                0.05,
-            ],
-            dtype=float,
-        )
-    )
-    upper = np.log(
-        np.array(
-            [
-                0.5,
-                0.5,
-                maximum_tau_1,
-                maximum_tau_gap,
-            ],
-            dtype=float,
-        )
-    )
-
-    resistance_1, resistance_2, tau_1, tau_2 = initial_rc
-
-
-    # Perturb the initial RC estimates to improve the robustness
-    # of the nonlinear optimization.
-    seeds = [
-        (
-            resistance_1,
-            resistance_2,
-            tau_1,
-            tau_2,
-        ),
-        (
-            0.7 * resistance_1,
-            1.3 * resistance_2,
-            0.7 * tau_1,
-            1.3 * tau_2,
-        ),
-        (
-            1.3 * resistance_1,
-            0.7 * resistance_2,
-            1.3 * tau_1,
-            max(
-                1.5 * tau_1,
-                0.8 * tau_2,
-            ),
-        ),
-    ]
-
-    best = None
-
-    for (
-        seed_resistance_1,
-        seed_resistance_2,
-        seed_tau_1,
-        seed_tau_2,
-    ) in seeds:
-        seed_tau_1 = max(
-            seed_tau_1,
-            minimum_tau * 1.01,
-        )
-        seed_tau_2 = max(
-            seed_tau_2,
-            seed_tau_1 + 0.051,
-        )
-
-        guess = np.log(
-            np.array(
-                [
-                    seed_resistance_1,
-                    seed_resistance_2,
-                    seed_tau_1,
-                    seed_tau_2 - seed_tau_1,
-                ],
-                dtype=float,
-            )
-        )
-
-        guess = np.clip(
-            guess,
-            lower + 1e-9,
-            upper - 1e-9,
-        )
-
-        candidate = least_squares(
-            residual,
-            guess,
-            bounds=(
-                lower,
-                upper,
-            ),
-            loss="soft_l1",
-            f_scale=5e-4,
-            max_nfev=3000,
-        )
-
-        if best is None or candidate.cost < best.cost:
-            best = candidate
-
-    if best is None:
-        raise RuntimeError("No load-and-rest fit candidate was generated.")
-
-    (
-        resistance_1,
-        resistance_2,
-        tau_1,
-        tau_2,
-    ) = unpack_direct_rc_parameters(best.x)
-
-    predicted = simulate_load_and_rest(
-        parameters=best.x,
-        window=window,
-        resistance_0_ohm=resistance_0_ohm,
-    )
-
-    residual_all = predicted - window.voltage_V
-
-    rest_time = window.time_s[window.rest_positions] - window.time_s[window.rest_positions[0]]
-
-    load_eval = window.pulse_positions[window.time_s[window.pulse_positions] >= 0.5]
-    rest_eval = window.rest_positions[rest_time >= 0.5]
-    overall_eval = np.unique(
-        np.concatenate(
-            [
-                load_eval,
-                rest_eval,
-            ]
-        )
-    )
-
-    def metrics(
-        positions: np.ndarray,
-    ) -> dict[str, float]:
-        values = residual_all[positions]
-        measured = window.voltage_V[positions]
-
-        denominator = float(np.sum((measured - np.mean(measured)) ** 2))
-
-        return {
-            "rmse_mV": float(np.sqrt(np.mean(values**2)) * 1000.0),
-            "mae_mV": float(np.mean(np.abs(values)) * 1000.0),
-            "R_squared": (float(1.0 - np.sum(values**2) / denominator) if denominator > 0 else np.nan),
-        }
-
-    # Evalute fit quality separately for the pulse, rest,
-    # and combined measurement windows.
-    overall = metrics(overall_eval)
-    load = metrics(load_eval)
-    rest = metrics(rest_eval)
-
-    try:
-        jacobian_condition = float(np.linalg.cond(best.jac.T @ best.jac))
-    except np.linalg.LinAlgError:
-        jacobian_condition = np.inf
-
-    pulse_current = float(np.median(window.current_A[window.pulse_positions]))
-    pulse_duration = window.pulse_duration_actual_s
-
-    # Derive the pulse-induced relaxation amplitudes from the fitted
-    # RC parameters and measured pulse duration.
-    amplitude_1 = abs(pulse_current) * resistance_1 * (1.0 - np.exp(-pulse_duration / tau_1))
-    amplitude_2 = abs(pulse_current) * resistance_2 * (1.0 - np.exp(-pulse_duration / tau_2))
-
-    result = {
-        "fit_method": "load_and_relaxation",
-        "optimizer_success": bool(best.success),
-        "optimizer_status": int(best.status),
-        "optimizer_message": str(best.message),
-        "optimizer_nfev": int(best.nfev),
-        "fit_sample_count": int(len(window.fit_positions)),
-        "amplitude_1_V": float(amplitude_1),
-        "amplitude_2_V": float(amplitude_2),
-        "R1_ohm": resistance_1,
-        "R2_ohm": resistance_2,
-        "C1_F": float(tau_1 / resistance_1),
-        "C2_F": float(tau_2 / resistance_2),
-        "R1_mohm": float(resistance_1 * 1000.0),
-        "R2_mohm": float(resistance_2 * 1000.0),
-        "tau_1_s": tau_1,
-        "tau_2_s": tau_2,
-        "tau_ratio": float(tau_2 / tau_1),
-        "fit_rmse_mV": overall["rmse_mV"],
-        "fit_mae_mV": overall["mae_mV"],
-        "fit_R_squared": overall["R_squared"],
-        "load_rmse_mV": load["rmse_mV"],
-        "load_mae_mV": load["mae_mV"],
-        "load_R_squared": load["R_squared"],
-        "rest_rmse_mV": rest["rmse_mV"],
-        "rest_mae_mV": rest["mae_mV"],
-        "rest_R_squared": rest["R_squared"],
-        "jacobian_condition": jacobian_condition,
-        "pre_rest_duration_s": (window.pre_rest_duration_s),
-        "rest_start_time_s": float(window.time_s[window.rest_positions[0]]),
-        "rest_end_time_s": float(window.time_s[-1]),
-        "rest_duration_s": (window.rest_duration_s),
-        "rest_raw_sample_count": int(len(window.rest_positions)),
-        "rest_dt_median_s": float(np.median(np.diff(rest_time))),
-        "recovery_final_V": float(amplitude_1 + amplitude_2),
-        "pulse_duration_actual_s": (pulse_duration),
-        "ocv_before_V": window.ocv_before_V,
-        "ocv_after_V": window.ocv_after_V,
-        "ocv_change_mV": float((window.ocv_after_V - window.ocv_before_V) * 1000.0),
-        "initial_RC_states": ("zero_after_detected_pre_rest"),
-    }
-
-    return result, predicted
-
 
 def quality_flags(
     result: dict[str, object],
@@ -1013,12 +509,14 @@ def fit_ecm_pulse(
     pulse: pd.Series,
     pulse_row_id: int,
     config: _BatteryConfigClass,
+    current_threshold_A: float = 0.05,
     guess_profile: str = "full",
-) -> tuple[dict[str, object], FitCurve | None]:
-    """Fit a complete second-order RC model to one HPPC pulse."""
+) -> dict[str, object]:
+    """Fit second-order RC parameters from one post-pulse rest period."""
 
     row = pulse.to_dict()
     row["pulse_row_id"] = pulse_row_id
+    row["fit_method"] = "rest_relaxation"
 
     # Calculate R0 using the existing PyDPEET resistance function.
     r0_result = calculate_pulse_r0(
@@ -1036,12 +534,13 @@ def fit_ecm_pulse(
                 "quality_flags": "R0_not_available",
             }
         )
-        return row, None
+        return row
 
-    # Fit the voltage relaxation first to obtain initial RC estimates.
+    # Extract the complete rest period following the pulse.
     rest = extract_rest_window(
         raw=raw,
         pulse=pulse,
+        current_threshold_A=current_threshold_A,
     )
 
     if rest is None:
@@ -1052,7 +551,7 @@ def fit_ecm_pulse(
                 "quality_flags": "rest_window_not_found",
             }
         )
-        return row, None
+        return row
 
     time_s, recovery_V, rest_metadata = rest
     row.update(rest_metadata)
@@ -1071,70 +570,71 @@ def fit_ecm_pulse(
                 "quality_flags": "rest_fit_failed",
             }
         )
-        return row, None
+        return row
+
+    row.update(relaxation_fit)
 
     current_abs_A = abs(float(pulse["mean_current_A"]))
     pulse_duration_s = float(pulse["pulse_duration_s"])
 
-    denominator_1 = current_abs_A * (1.0 - np.exp(-pulse_duration_s / float(relaxation_fit["tau_1_s"])))
-    denominator_2 = current_abs_A * (1.0 - np.exp(-pulse_duration_s / float(relaxation_fit["tau_2_s"])))
+    if current_abs_A <= 0.0 or pulse_duration_s <= 0.0:
+        row.update(
+            {
+                "fit_valid": False,
+                "fit_exclusion_reason": "invalid_pulse_current_or_duration",
+                "quality_flags": "invalid_pulse_current_or_duration",
+            }
+        )
+        return row
+
+    tau_1_s = float(relaxation_fit["tau_1_s"])
+    tau_2_s = float(relaxation_fit["tau_2_s"])
+
+    denominator_1 = current_abs_A * (
+        1.0 - np.exp(-pulse_duration_s / tau_1_s)
+    )
+    denominator_2 = current_abs_A * (
+        1.0 - np.exp(-pulse_duration_s / tau_2_s)
+    )
 
     if denominator_1 <= 0.0 or denominator_2 <= 0.0:
         row.update(
             {
                 "fit_valid": False,
-                "fit_exclusion_reason": "invalid_initial_RC_estimate",
-                "quality_flags": "invalid_initial_RC_estimate",
+                "fit_exclusion_reason": "invalid_RC_denominator",
+                "quality_flags": "invalid_RC_denominator",
             }
         )
-        return row, None
+        return row
 
-    # Convert the fitted recovery amplitudes into initial polarization
-    # resistance estimates using pulse current and duration.
-    seed_r1_ohm = float(relaxation_fit["amplitude_1_V"]) / denominator_1
-    seed_r2_ohm = float(relaxation_fit["amplitude_2_V"]) / denominator_2
-
-    # Fit the measured pulse and following rest together.
-    window = extract_load_and_rest_window(
-        raw=raw,
-        pulse=pulse,
+    resistance_1_ohm = (
+        float(relaxation_fit["amplitude_1_V"])
+        / denominator_1
+    )
+    resistance_2_ohm = (
+        float(relaxation_fit["amplitude_2_V"])
+        / denominator_2
     )
 
-    if window is None:
-        row.update(
-            {
-                "fit_valid": False,
-                "fit_exclusion_reason": ("load_and_rest_window_not_found"),
-                "quality_flags": ("load_and_rest_window_not_found"),
-            }
-        )
-        return row, None
+    capacitance_1_F = tau_1_s / resistance_1_ohm
+    capacitance_2_F = tau_2_s / resistance_2_ohm
 
-    try:
-        fit_result, predicted_voltage_V = fit_load_and_rest_window(
-            window=window,
-            resistance_0_ohm=float(r0_result["R0_ohm"]),
-            initial_rc=(
-                seed_r1_ohm,
-                seed_r2_ohm,
-                float(relaxation_fit["tau_1_s"]),
-                float(relaxation_fit["tau_2_s"]),
-            ),
-        )
-    except Exception as error:
-        row.update(
-            {
-                "fit_valid": False,
-                "fit_exclusion_reason": (f"load_and_rest_fit_failed:{error}"),
-                "quality_flags": "load_and_rest_fit_failed",
-            }
-        )
-        return row, None
-
-    row.update(fit_result)
+    row.update(
+        {
+            "R0_mohm": float(row["R0_ohm"]) * 1000.0,
+            "R1_ohm": resistance_1_ohm,
+            "R2_ohm": resistance_2_ohm,
+            "R1_mohm": resistance_1_ohm * 1000.0,
+            "R2_mohm": resistance_2_ohm * 1000.0,
+            "C1_F": capacitance_1_F,
+            "C2_F": capacitance_2_F,
+            "pulse_duration_actual_s": pulse_duration_s,
+        }
+    )
 
     required_parameters = np.asarray(
         [
+            row["R0_ohm"],
             row["R1_ohm"],
             row["R2_ohm"],
             row["C1_F"],
@@ -1145,8 +645,6 @@ def fit_ecm_pulse(
         dtype=float,
     )
 
-    # Mark the fit as valid only if optimization succeeds and the 
-    # estimated RC parameters are finite, positive, and ordered.
     row["fit_valid"] = bool(
         row["optimizer_success"]
         and np.isfinite(required_parameters).all()
@@ -1154,129 +652,423 @@ def fit_ecm_pulse(
         and float(row["tau_2_s"]) > float(row["tau_1_s"])
     )
 
-    row["fit_exclusion_reason"] = "" if row["fit_valid"] else "nonphysical_fit"
-    row["quality_flags"] = quality_flags(row) if row["fit_valid"] else "nonphysical_fit"
-
-    rest_positions = window.rest_positions
-    rest_voltage_V = window.voltage_V[rest_positions]
-    fitted_rest_voltage_V = predicted_voltage_V[rest_positions]
-
-    direction_sign = 1.0 if str(pulse["pulse_direction"]) == "discharge" else -1.0
-
-    curve = FitCurve(
-        pulse_row_id=pulse_row_id,
-        time_s=(window.time_s[rest_positions] - window.time_s[rest_positions[0]]),
-        recovery_measured_V=direction_sign * (rest_voltage_V - rest_voltage_V[0]),
-        recovery_fitted_V=direction_sign * (fitted_rest_voltage_V - fitted_rest_voltage_V[0]),
+    row["fit_exclusion_reason"] = (
+        ""
+        if row["fit_valid"]
+        else "nonphysical_fit"
+    )
+    row["quality_flags"] = (
+        quality_flags(row)
+        if row["fit_valid"]
+        else "nonphysical_fit"
     )
 
-    return row, curve
+    return row
+
+_PARAMETER_PLOT_COLUMNS = (
+    ("R0_mohm", r"$R_0$ [m$\Omega$]"),
+    ("R1_mohm", r"$R_1$ [m$\Omega$]"),
+    ("R2_mohm", r"$R_2$ [m$\Omega$]"),
+    ("C1_F", r"$C_1$ [F]"),
+    ("C2_F", r"$C_2$ [F]"),
+    ("tau_1_s", r"$\tau_1$ [s]"),
+    ("tau_2_s", r"$\tau_2$ [s]"),
+)
+
+
+def _valid_parameter_rows(parameters: pd.DataFrame) -> pd.DataFrame:
+    """Return rows that passed the physical-fit checks."""
+
+    rows = parameters.copy()
+    if "fit_valid" in rows.columns:
+        rows = rows.loc[rows["fit_valid"].fillna(False).astype(bool)]
+    return rows
+
+
+def _block_plot_label(block: pd.DataFrame) -> str:
+    """Create a compact label for one HPPC block."""
+
+    cell_id = str(block["cell_id"].iloc[0])
+    block_id = block["hppc_block_id"].iloc[0]
+
+    for column, prefix in (
+        ("FEC", "FEC"),
+        ("calendar_age_days", "day"),
+    ):
+        if column not in block.columns:
+            continue
+        value = pd.to_numeric(block[column], errors="coerce").dropna()
+        if not value.empty:
+            return f"{cell_id}, {prefix} {float(value.iloc[0]):g}"
+
+    return f"{cell_id}, block {block_id}"
+
+
+def _plot_parameters_over_soc(parameters: pd.DataFrame) -> None:
+    """Plot valid ECM parameters over measured SOC for each HPPC block."""
+
+    rows = _valid_parameter_rows(parameters)
+    if rows.empty or "SOC" not in rows.columns:
+        return
+
+    specs = [
+        (column, label)
+        for column, label in _PARAMETER_PLOT_COLUMNS
+        if column in rows.columns
+    ]
+    if not specs:
+        return
+
+    fig, axes = plt.subplots(
+        3,
+        3,
+        figsize=(12.0, 9.0),
+        constrained_layout=False,
+    )
+    flat_axes = axes.ravel()
+
+    for _, block in rows.groupby(
+        ["cell_id", "hppc_block_id"],
+        sort=True,
+        dropna=False,
+    ):
+        block = block.copy()
+        block["SOC"] = pd.to_numeric(block["SOC"], errors="coerce")
+        block = block.dropna(subset=["SOC"]).sort_values("SOC")
+        if block.empty:
+            continue
+
+        label = _block_plot_label(block)
+        for axis, (column, y_label) in zip(
+            flat_axes,
+            specs,
+            strict=False,
+        ):
+            values = pd.to_numeric(block[column], errors="coerce")
+            finite = np.isfinite(block["SOC"]) & np.isfinite(values)
+            axis.plot(
+                block.loc[finite, "SOC"],
+                values.loc[finite],
+                marker="o",
+                markersize=3.5,
+                linewidth=1.2,
+                label=label,
+            )
+            axis.set_xlabel("SOC [-]")
+            axis.set_ylabel(y_label)
+            axis.grid(alpha=0.25)
+
+    for axis in flat_axes[len(specs):]:
+        axis.set_visible(False)
+
+    handles, labels = flat_axes[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="center left",
+            bbox_to_anchor=(0.82, 0.5),
+            frameon=False,
+        )
+    fig.suptitle("Second-order RC parameters over SOC")
+    fig.tight_layout(rect=(0.0, 0.0, 0.80, 0.96))
+    plt.show()
+
+
+def _plot_parameters_over_age(
+    parameters: pd.DataFrame,
+    x_column: str,
+    x_label: str,
+) -> None:
+    """Plot parameters over an ageing axis, with color encoding SOC."""
+
+    rows = _valid_parameter_rows(parameters)
+    if x_column not in rows.columns or "SOC" not in rows.columns:
+        return
+
+    rows = rows.copy()
+    rows[x_column] = pd.to_numeric(rows[x_column], errors="coerce")
+    rows["SOC"] = pd.to_numeric(rows["SOC"], errors="coerce")
+    rows = rows.loc[
+        np.isfinite(rows[x_column])
+        & np.isfinite(rows["SOC"])
+    ]
+    if rows.empty:
+        return
+
+    specs = [
+        (column, label)
+        for column, label in _PARAMETER_PLOT_COLUMNS
+        if column in rows.columns
+    ]
+    if not specs:
+        return
+
+    fig, axes = plt.subplots(
+        3,
+        3,
+        figsize=(12.0, 9.0),
+        constrained_layout=True,
+    )
+    flat_axes = axes.ravel()
+    color_source = None
+
+    for axis, (column, y_label) in zip(
+        flat_axes,
+        specs,
+        strict=False,
+    ):
+        values = pd.to_numeric(rows[column], errors="coerce")
+        finite = np.isfinite(values)
+        color_source = axis.scatter(
+            rows.loc[finite, x_column],
+            values.loc[finite],
+            c=rows.loc[finite, "SOC"],
+            cmap="viridis",
+            vmin=0.0,
+            vmax=1.0,
+            s=24,
+            alpha=0.85,
+        )
+        axis.set_xlabel(x_label)
+        axis.set_ylabel(y_label)
+        axis.grid(alpha=0.25)
+
+    for axis in flat_axes[len(specs):]:
+        axis.set_visible(False)
+
+    if color_source is not None:
+        colorbar = fig.colorbar(
+            color_source,
+            ax=[axis for axis in flat_axes[:len(specs)]],
+            shrink=0.82,
+        )
+        colorbar.set_label("SOC [-]")
+
+    fig.suptitle(f"Second-order RC parameters over {x_label}")
+    plt.show()
+
+
+def _plot_ecm_parameters(parameters: pd.DataFrame) -> None:
+    """Create all parameter overview figures supported by the metadata."""
+
+    _plot_parameters_over_soc(parameters)
+    _plot_parameters_over_age(parameters, "FEC", "FEC [-]")
+    _plot_parameters_over_age(
+        parameters,
+        "calendar_age_days",
+        "Calendar age [days]",
+    )
 
 
 def create_ecm_parameters(
-    hppc_blocks: pd.DataFrame | list[pd.DataFrame],
+    df: pd.DataFrame,
+    hppc_segments: pd.DataFrame,
     config: _BatteryConfigClass,
-    cell_id: str,
     block_metadata: list[dict[str, object]] | None = None,
     current_threshold_A: float = 0.05,
     guess_profile: str = "full",
-) -> tuple[pd.DataFrame, list[FitCurve]]:
-    """Fit 2RC parameters for user-supplied HPPC blocks.
+    visualize: bool = False,
+) -> pd.DataFrame:
+    """Fit 2RC parameters using automatically detected HPPC segments.
 
-    The caller must identify the HPPC blocks. Within each block, consecutive
-    current segments are extracted automatically. Every non-rest segment that
-    is followed by a rest segment is treated as one pulse candidate.
-
-    Optional block metadata, such as checkup number, calendar age, or FEC, is
-    copied into the corresponding result rows.
+    ``df`` contains the complete measurement data. ``hppc_segments`` is
+    the table returned by ``extract_hppc_segments``. Optional metadata,
+    including FEC and calendar age, is copied to every pulse belonging
+    to the corresponding HPPC block.
     """
 
-    blocks = [hppc_blocks] if isinstance(hppc_blocks, pd.DataFrame) else list(hppc_blocks)
-
-    if not blocks:
-        return pd.DataFrame(), []
-
-    if block_metadata is None:
-        metadata = [{} for _ in blocks]
-    else:
-        if len(block_metadata) != len(blocks):
-            raise ValueError("block_metadata must contain one entry per HPPC block.")
-        metadata = block_metadata
-
-    result_rows: list[dict[str, object]] = []
-    fit_curves: list[FitCurve] = []
-    pulse_row_id = 0
-
-    for block_id, (raw, block_info) in enumerate(
-        zip(
-            blocks,
-            metadata,
-            strict=True,
+    if not isinstance(df, pd.DataFrame):
+        raise ValueError("df must be a pandas DataFrame.")
+    if not isinstance(hppc_segments, pd.DataFrame):
+        raise ValueError(
+            "hppc_segments must be a pandas DataFrame."
         )
-    ):
-        segments = extract_current_segments(
-            df=raw,
-            cell_id=cell_id,
-            current_threshold_A=current_threshold_A,
+    if not isinstance(visualize, bool):
+        raise ValueError("visualize must be a boolean.")
+
+    if hppc_segments.empty:
+        return pd.DataFrame()
+
+    required_raw_columns = {
+        "TestIndex",
+        "Test_Time[s]",
+        "Current[A]",
+        "Voltage[V]",
+    }
+    missing_raw = sorted(
+        required_raw_columns - set(df.columns)
+    )
+    if missing_raw:
+        raise ValueError(
+            f"df is missing required columns: {missing_raw}"
         )
 
-        if segments.empty:
-            continue
+    required_segment_columns = {
+        "cell_id",
+        "TestIndex",
+        "run_index",
+        "state",
+        "start_time_s",
+        "end_time_s",
+        "duration_s",
+        "mean_current_A",
+        "soc_start",
+        "hppc_block_id",
+        "hppc_role",
+    }
+    missing_segments = sorted(
+        required_segment_columns - set(hppc_segments.columns)
+    )
+    if missing_segments:
+        raise ValueError(
+            "hppc_segments is missing required columns: "
+            f"{missing_segments}"
+        )
 
-        following_state = segments["state"].shift(-1)
-        following_test_index = segments["TestIndex"].shift(-1)
-
-        # Identify pulse candidates as non-rest segments immediately
-        # followed by rest within the same TextIndex.
-        pulse_mask = segments["state"].ne(0) & following_state.eq(0) & segments["TestIndex"].eq(following_test_index)
-
-        pulse_segments = segments.loc[pulse_mask]
-
-        numeric_test_index = pd.to_numeric(
-            raw["TestIndex"],
+    block_ids = sorted(
+        pd.to_numeric(
+            hppc_segments["hppc_block_id"],
             errors="coerce",
         )
+        .dropna()
+        .astype(int)
+        .unique()
+        .tolist()
+    )
 
-        for _, segment in pulse_segments.iterrows():
-            pulse = segment.copy()
+    if not block_ids:
+        return pd.DataFrame()
 
-            pulse["pulse_start_time_s"] = float(segment["start_time_s"])
-            pulse["pulse_end_time_s"] = float(segment["end_time_s"])
-            pulse["pulse_duration_s"] = float(segment["duration_s"])
-            pulse["pulse_direction"] = "charge" if float(segment["mean_current_A"]) > 0.0 else "discharge"
-            pulse["SOC"] = float(segment["soc_start"])
-            pulse["SOC_is_physical"] = bool(np.isfinite(pulse["SOC"]) and 0.0 <= pulse["SOC"] <= 1.0)
-
-            test_index = float(segment["TestIndex"])
-            raw_test = raw.loc[numeric_test_index.eq(test_index)].copy()
-
-            # Fit each pulse independently using measurements from
-            # its corresponding TestIndex.
-            result, curve = fit_ecm_pulse(
-                raw=raw_test,
-                pulse=pulse,
-                pulse_row_id=pulse_row_id,
-                config=config,
-                guess_profile=guess_profile,
+    if block_metadata is None:
+        metadata_by_block = {
+            block_id: {}
+            for block_id in block_ids
+        }
+    else:
+        if len(block_metadata) != len(block_ids):
+            raise ValueError(
+                "block_metadata must contain one entry "
+                "per HPPC block."
             )
 
-            result["hppc_block_id"] = block_id
+        metadata_by_block = dict(
+            zip(
+                block_ids,
+                block_metadata,
+                strict=True,
+            )
+        )
 
-            # Preserve user-supplied block metadata without overwriting
-            # existing fit results.
-            for key, value in block_info.items():
-                if key not in result:
-                    result[key] = value
+    numeric_raw_test_index = pd.to_numeric(
+        df["TestIndex"],
+        errors="coerce",
+    )
+    numeric_block_id = pd.to_numeric(
+        hppc_segments["hppc_block_id"],
+        errors="coerce",
+    )
 
-            result_rows.append(result)
+    result_rows: list[dict[str, object]] = []
+    pulse_row_id = 0
 
-            if curve is not None:
-                fit_curves.append(curve)
+    for block_id in block_ids:
+        block_segments = hppc_segments.loc[
+            numeric_block_id.eq(block_id)
+        ].copy()
 
-            pulse_row_id += 1
+        block_info = metadata_by_block[block_id]
 
-    return pd.DataFrame(result_rows), fit_curves
+        for test_index, segments in block_segments.groupby(
+            "TestIndex",
+            sort=True,
+        ):
+            segments = segments.sort_values(
+                "run_index"
+            ).reset_index(drop=True)
 
+            following_state = segments["state"].shift(-1)
+
+            pulse_mask = (
+                segments["hppc_role"].eq("pulse")
+                & segments["state"].ne(0)
+                & following_state.eq(0)
+            )
+            pulse_segments = segments.loc[pulse_mask]
+
+            numeric_test_index = pd.to_numeric(
+                pd.Series([test_index]),
+                errors="coerce",
+            ).iloc[0]
+
+            if pd.isna(numeric_test_index):
+                continue
+
+            raw_test = df.loc[
+                numeric_raw_test_index.eq(
+                    float(numeric_test_index)
+                )
+            ].copy()
+
+            if raw_test.empty:
+                continue
+
+            raw_test = raw_test.sort_values(
+                "Test_Time[s]"
+            ).reset_index(drop=True)
+
+            for _, segment in pulse_segments.iterrows():
+                pulse = segment.copy()
+
+                pulse["pulse_start_time_s"] = float(
+                    segment["start_time_s"]
+                )
+                pulse["pulse_end_time_s"] = float(
+                    segment["end_time_s"]
+                )
+                pulse["pulse_duration_s"] = float(
+                    segment["duration_s"]
+                )
+                pulse["pulse_direction"] = (
+                    "charge"
+                    if float(segment["mean_current_A"]) > 0.0
+                    else "discharge"
+                )
+                pulse["SOC"] = float(
+                    segment["soc_start"]
+                )
+                pulse["SOC_is_physical"] = bool(
+                    np.isfinite(pulse["SOC"])
+                    and 0.0 <= pulse["SOC"] <= 1.0
+                )
+
+                result = fit_ecm_pulse(
+                    raw=raw_test,
+                    pulse=pulse,
+                    pulse_row_id=pulse_row_id,
+                    config=config,
+                    current_threshold_A=(
+                        current_threshold_A
+                    ),
+                    guess_profile=guess_profile,
+                )
+
+                result["hppc_block_id"] = block_id
+
+                # Preserve FEC, calendar age, and other metadata.
+                for key, value in block_info.items():
+                    if key not in result:
+                        result[key] = value
+
+                result_rows.append(result)
+                pulse_row_id += 1
+
+    results = pd.DataFrame(result_rows)
+
+    if visualize and not results.empty:
+        _plot_ecm_parameters(results)
+
+    return results
 
 def calculate_pulse_r0(
     raw: pd.DataFrame,
@@ -1364,3 +1156,6 @@ def calculate_pulse_r0(
         "R0_source": r0_source,
         "R0_valid": bool(np.isfinite(r0_ohm) and r0_ohm > 0),
     }
+
+
+__all__ = ["create_ecm_parameters"]
