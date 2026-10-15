@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 from pydpeet.process.analyze.extract.hppc import (
-    extract_current_segments,
+    _segment_complete_data,
 )
 
 
@@ -50,7 +50,7 @@ def test_extract_current_segments_merges_across_batches() -> None:
         }
     )
 
-    segments = extract_current_segments(
+    segments = _segment_complete_data(
         df=data,
         cell_id="test-cell",
         current_threshold_A=0.05,
@@ -105,7 +105,9 @@ def test_extract_current_segments_requires_columns() -> None:
         ValueError,
         match="Missing required columns",
     ):
-        extract_current_segments(
+        _segment_complete_data(
             df=data,
             cell_id="test-cell",
+            current_threshold_A=0.05,
+            batch_size=500_000,
         )

@@ -676,13 +676,151 @@ _PARAMETER_PLOT_COLUMNS = (
 )
 
 
-def _valid_parameter_rows(parameters: pd.DataFrame) -> pd.DataFrame:
-    """Return rows that passed the physical-fit checks."""
+def _annotate_quality_status(parameters: pd.DataFrame) -> pd.DataFrame:
+    """Classify fits as pass, review, or excluded."""
 
     rows = parameters.copy()
-    if "fit_valid" in rows.columns:
-        rows = rows.loc[rows["fit_valid"].fillna(False).astype(bool)]
+    valid = rows.get(
+        "fit_valid",
+        pd.Series(False, index=rows.index),
+    ).fillna(False).astype(bool)
+    flags = rows.get(
+        "quality_flags",
+        pd.Series("", index=rows.index),
+    ).fillna("").astype(str).str.strip()
+
+    # 与原 NMC workflow 一致：有效且无警告为 pass，有警告为 review。
+    rows["quality_status"] = "excluded"
+    rows.loc[valid & flags.eq(""), "quality_status"] = "pass"
+    rows.loc[valid & flags.ne(""), "quality_status"] = "review"
     return rows
+
+
+def _annotate_soc_paths(parameters: pd.DataFrame) -> pd.DataFrame:
+    """Identify descending and ascending SOC paths within each HPPC block."""
+
+    rows = parameters.copy()
+    rows["soc_path"] = "unclear"
+    rows["sweep_id"] = 0
+
+    required = {
+        "cell_id",
+        "TestIndex",
+        "hppc_block_id",
+        "pulse_start_time_s",
+        "SOC",
+    }
+    if rows.empty or not required.issubset(rows.columns):
+        return rows
+
+    group_columns = ["cell_id", "TestIndex", "hppc_block_id"]
+    for _, sequence in rows.groupby(
+        group_columns,
+        dropna=False,
+        sort=False,
+    ):
+        ordered = sequence.copy()
+        ordered["_time"] = pd.to_numeric(
+            ordered["pulse_start_time_s"],
+            errors="coerce",
+        )
+        ordered["_soc"] = pd.to_numeric(
+            ordered["SOC"],
+            errors="coerce",
+        )
+        ordered = ordered.dropna(subset=["_time", "_soc"])
+        ordered = ordered.loc[ordered["_soc"].between(0.0, 1.0)]
+        ordered = ordered.sort_values("_time", kind="stable")
+        if ordered.empty:
+            continue
+
+        soc = ordered["_soc"].to_numpy(dtype=float)
+        first_soc = float(soc[0])
+        last_soc = float(soc[-1])
+        minimum_position = int(np.argmin(soc))
+        maximum_position = int(np.argmax(soc))
+        minimum_soc = float(np.min(soc))
+        maximum_soc = float(np.max(soc))
+
+        # 只有 SOC 两侧都变化至少 20 percentage points，才判定为转折。
+        down_up = (
+            0 < minimum_position < len(ordered) - 1
+            and first_soc - minimum_soc >= 0.20
+            and last_soc - minimum_soc >= 0.20
+        )
+        up_down = (
+            0 < maximum_position < len(ordered) - 1
+            and maximum_soc - first_soc >= 0.20
+            and maximum_soc - last_soc >= 0.20
+        )
+
+        if down_up:
+            descending = ordered.index[: minimum_position + 1]
+            ascending = ordered.index[minimum_position + 1 :]
+            rows.loc[descending, ["soc_path", "sweep_id"]] = (
+                "descending",
+                1,
+            )
+            rows.loc[ascending, ["soc_path", "sweep_id"]] = (
+                "ascending",
+                2,
+            )
+        elif up_down:
+            ascending = ordered.index[: maximum_position + 1]
+            descending = ordered.index[maximum_position + 1 :]
+            rows.loc[ascending, ["soc_path", "sweep_id"]] = (
+                "ascending",
+                1,
+            )
+            rows.loc[descending, ["soc_path", "sweep_id"]] = (
+                "descending",
+                2,
+            )
+        else:
+            path = "ascending" if last_soc > first_soc else "descending"
+            rows.loc[ordered.index, ["soc_path", "sweep_id"]] = (
+                path,
+                1,
+            )
+
+    rows["sweep_id"] = pd.to_numeric(
+        rows["sweep_id"],
+        errors="coerce",
+    ).fillna(0).astype(int)
+    return rows
+
+
+def _filter_parameter_rows(
+    parameters: pd.DataFrame,
+    quality_statuses: tuple[str, ...],
+    pulse_directions: tuple[str, ...],
+    soc_paths: tuple[str, ...],
+    target_current_abs_A: float | None,
+    current_tolerance_A: float,
+) -> pd.DataFrame:
+    """Apply the NMC workflow selection rules used for parameter plots."""
+
+    rows = parameters.copy()
+    for column, allowed in (
+        ("quality_status", quality_statuses),
+        ("pulse_direction", pulse_directions),
+        ("soc_path", soc_paths),
+    ):
+        if column not in rows.columns:
+            return rows.iloc[0:0].copy()
+        rows = rows.loc[rows[column].isin(allowed)]
+
+    if target_current_abs_A is not None:
+        current = pd.to_numeric(
+            rows["mean_current_A"],
+            errors="coerce",
+        ).abs()
+        rows = rows.loc[
+            (current - float(target_current_abs_A)).abs()
+            <= float(current_tolerance_A)
+        ]
+
+    return rows.copy()
 
 
 def _block_plot_label(block: pd.DataFrame) -> str:
@@ -704,11 +842,29 @@ def _block_plot_label(block: pd.DataFrame) -> str:
     return f"{cell_id}, block {block_id}"
 
 
-def _plot_parameters_over_soc(parameters: pd.DataFrame) -> None:
-    """Plot valid ECM parameters over measured SOC for each HPPC block."""
+def _plot_parameters_over_soc(
+    parameters: pd.DataFrame,
+    pulse_direction: str,
+    soc_path: str,
+) -> None:
+    """Plot one pulse direction and one SOC path without mixing curves."""
 
-    rows = _valid_parameter_rows(parameters)
+    rows = parameters.loc[
+        parameters["pulse_direction"].eq(pulse_direction)
+        & parameters["soc_path"].eq(soc_path)
+    ].copy()
     if rows.empty or "SOC" not in rows.columns:
+        return
+
+    rows["SOC"] = pd.to_numeric(rows["SOC"], errors="coerce")
+    rows = rows.dropna(subset=["SOC"])
+    series_size = rows.groupby(
+        ["cell_id", "hppc_block_id"],
+        dropna=False,
+    )["SOC"].transform("size")
+    # 单点不能构成趋势曲线，因此不在参数图中显示。
+    rows = rows.loc[series_size >= 2]
+    if rows.empty:
         return
 
     specs = [
@@ -746,6 +902,8 @@ def _plot_parameters_over_soc(parameters: pd.DataFrame) -> None:
         ):
             values = pd.to_numeric(block[column], errors="coerce")
             finite = np.isfinite(block["SOC"]) & np.isfinite(values)
+            if int(finite.sum()) < 2:
+                continue
             axis.plot(
                 block.loc[finite, "SOC"],
                 values.loc[finite],
@@ -770,29 +928,93 @@ def _plot_parameters_over_soc(parameters: pd.DataFrame) -> None:
             bbox_to_anchor=(0.82, 0.5),
             frameon=False,
         )
-    fig.suptitle("Second-order RC parameters over SOC")
+    quality_label = ", ".join(
+        sorted(rows["quality_status"].astype(str).unique())
+    )
+    fig.suptitle(
+        "Second-order RC parameters over SOC\n"
+        f"{pulse_direction} pulse, SOC {soc_path}, quality: {quality_label}"
+    )
     fig.tight_layout(rect=(0.0, 0.0, 0.80, 0.96))
     plt.show()
+
+
+def _select_target_soc_rows(
+    parameters: pd.DataFrame,
+    target_socs: tuple[float, ...],
+    soc_tolerance: float,
+) -> pd.DataFrame:
+    """Select the nearest measured point at each requested diagnostic SOC."""
+
+    selected_rows: list[pd.Series] = []
+    group_columns = [
+        "cell_id",
+        "hppc_block_id",
+        "pulse_direction",
+        "soc_path",
+    ]
+    for _, block in parameters.groupby(
+        group_columns,
+        dropna=False,
+        sort=False,
+    ):
+        block = block.copy()
+        block["SOC"] = pd.to_numeric(block["SOC"], errors="coerce")
+        block = block.loc[block["SOC"].between(0.0, 1.0)]
+        if block.empty:
+            continue
+
+        for target_soc in target_socs:
+            distance = (block["SOC"] - float(target_soc)).abs()
+            nearest_index = distance.idxmin()
+            if float(distance.loc[nearest_index]) > (
+                float(soc_tolerance) + 1e-12
+            ):
+                continue
+            row = block.loc[nearest_index].copy()
+            row["target_SOC"] = float(target_soc)
+            row["SOC_distance"] = float(distance.loc[nearest_index])
+            selected_rows.append(row)
+
+    if not selected_rows:
+        return parameters.iloc[0:0].assign(
+            target_SOC=pd.Series(dtype=float),
+            SOC_distance=pd.Series(dtype=float),
+        )
+    return pd.DataFrame(selected_rows).reset_index(drop=True)
 
 
 def _plot_parameters_over_age(
     parameters: pd.DataFrame,
     x_column: str,
     x_label: str,
+    pulse_direction: str,
+    soc_path: str,
+    target_socs: tuple[float, ...],
+    soc_tolerance: float,
 ) -> None:
-    """Plot parameters over an ageing axis, with color encoding SOC."""
+    """Plot parameters over ageing at fixed diagnostic SOC values."""
 
-    rows = _valid_parameter_rows(parameters)
+    rows = parameters.loc[
+        parameters["pulse_direction"].eq(pulse_direction)
+        & parameters["soc_path"].eq(soc_path)
+    ].copy()
     if x_column not in rows.columns or "SOC" not in rows.columns:
         return
 
-    rows = rows.copy()
+    rows = _select_target_soc_rows(
+        parameters=rows,
+        target_socs=target_socs,
+        soc_tolerance=soc_tolerance,
+    )
     rows[x_column] = pd.to_numeric(rows[x_column], errors="coerce")
-    rows["SOC"] = pd.to_numeric(rows["SOC"], errors="coerce")
-    rows = rows.loc[
-        np.isfinite(rows[x_column])
-        & np.isfinite(rows["SOC"])
-    ]
+    rows = rows.loc[np.isfinite(rows[x_column])]
+    series_size = rows.groupby(
+        ["cell_id", "target_SOC"],
+        dropna=False,
+    )[x_column].transform("size")
+    # 老化曲线至少需要两个老化状态，孤立点不显示。
+    rows = rows.loc[series_size >= 2]
     if rows.empty:
         return
 
@@ -808,28 +1030,36 @@ def _plot_parameters_over_age(
         3,
         3,
         figsize=(12.0, 9.0),
-        constrained_layout=True,
+        constrained_layout=False,
     )
     flat_axes = axes.ravel()
-    color_source = None
-
     for axis, (column, y_label) in zip(
         flat_axes,
         specs,
         strict=False,
     ):
-        values = pd.to_numeric(rows[column], errors="coerce")
-        finite = np.isfinite(values)
-        color_source = axis.scatter(
-            rows.loc[finite, x_column],
-            values.loc[finite],
-            c=rows.loc[finite, "SOC"],
-            cmap="viridis",
-            vmin=0.0,
-            vmax=1.0,
-            s=24,
-            alpha=0.85,
-        )
+        for (cell_id, target_soc), series in rows.groupby(
+            ["cell_id", "target_SOC"],
+            dropna=False,
+            sort=True,
+        ):
+            series = series.copy()
+            series["_value"] = pd.to_numeric(
+                series[column],
+                errors="coerce",
+            )
+            series = series.dropna(subset=[x_column, "_value"])
+            series = series.sort_values(x_column, kind="stable")
+            if len(series) < 2:
+                continue
+            axis.plot(
+                series[x_column],
+                series["_value"],
+                marker="o",
+                markersize=3.5,
+                linewidth=1.2,
+                label=f"{cell_id}, SOC {100.0 * float(target_soc):g}%",
+            )
         axis.set_xlabel(x_label)
         axis.set_ylabel(y_label)
         axis.grid(alpha=0.25)
@@ -837,28 +1067,81 @@ def _plot_parameters_over_age(
     for axis in flat_axes[len(specs):]:
         axis.set_visible(False)
 
-    if color_source is not None:
-        colorbar = fig.colorbar(
-            color_source,
-            ax=[axis for axis in flat_axes[:len(specs)]],
-            shrink=0.82,
+    handles, labels = flat_axes[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="center left",
+            bbox_to_anchor=(0.82, 0.5),
+            frameon=False,
         )
-        colorbar.set_label("SOC [-]")
-
-    fig.suptitle(f"Second-order RC parameters over {x_label}")
+    quality_label = ", ".join(
+        sorted(rows["quality_status"].astype(str).unique())
+    )
+    fig.suptitle(
+        f"Second-order RC parameters over {x_label}\n"
+        f"{pulse_direction} pulse, SOC {soc_path}, quality: {quality_label}"
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 0.80, 0.94))
     plt.show()
 
 
-def _plot_ecm_parameters(parameters: pd.DataFrame) -> None:
-    """Create all parameter overview figures supported by the metadata."""
+def _plot_ecm_parameters(
+    parameters: pd.DataFrame,
+    quality_statuses: tuple[str, ...],
+    pulse_directions: tuple[str, ...],
+    soc_paths: tuple[str, ...],
+    target_current_abs_A: float | None,
+    current_tolerance_A: float,
+    target_socs: tuple[float, ...],
+    soc_tolerance: float,
+) -> None:
+    """Create filtered NMC-style SOC and ageing parameter figures."""
 
-    _plot_parameters_over_soc(parameters)
-    _plot_parameters_over_age(parameters, "FEC", "FEC [-]")
-    _plot_parameters_over_age(
-        parameters,
-        "calendar_age_days",
-        "Calendar age [days]",
+    rows = _filter_parameter_rows(
+        parameters=parameters,
+        quality_statuses=quality_statuses,
+        pulse_directions=pulse_directions,
+        soc_paths=soc_paths,
+        target_current_abs_A=target_current_abs_A,
+        current_tolerance_A=current_tolerance_A,
     )
+    if rows.empty:
+        return
+
+    # 每个脉冲方向和 SOC 路径独立作图，避免同一 SOC 的点被错误连接。
+    for pulse_direction in pulse_directions:
+        for soc_path in soc_paths:
+            combination = rows.loc[
+                rows["pulse_direction"].eq(pulse_direction)
+                & rows["soc_path"].eq(soc_path)
+            ]
+            if combination.empty:
+                continue
+            _plot_parameters_over_soc(
+                rows,
+                pulse_direction,
+                soc_path,
+            )
+            _plot_parameters_over_age(
+                rows,
+                "FEC",
+                "FEC [-]",
+                pulse_direction,
+                soc_path,
+                target_socs,
+                soc_tolerance,
+            )
+            _plot_parameters_over_age(
+                rows,
+                "calendar_age_days",
+                "Calendar age [days]",
+                pulse_direction,
+                soc_path,
+                target_socs,
+                soc_tolerance,
+            )
 
 
 def create_ecm_parameters(
@@ -869,13 +1152,30 @@ def create_ecm_parameters(
     current_threshold_A: float = 0.05,
     guess_profile: str = "full",
     visualize: bool = False,
+    plot_quality_statuses: tuple[str, ...] = ("pass",),
+    plot_pulse_directions: tuple[str, ...] = (
+        "charge",
+        "discharge",
+    ),
+    plot_soc_paths: tuple[str, ...] = (
+        "descending",
+        "ascending",
+    ),
+    plot_target_current_abs_A: float | None = 4.8,
+    plot_current_tolerance_A: float = 0.25,
+    plot_target_socs: tuple[float, ...] = (0.25, 0.50, 0.75),
+    plot_soc_tolerance: float = 0.02,
 ) -> pd.DataFrame:
     """Fit 2RC parameters using automatically detected HPPC segments.
 
     ``df`` contains the complete measurement data. ``hppc_segments`` is
     the table returned by ``extract_hppc_segments``. Optional metadata,
     including FEC and calendar age, is copied to every pulse belonging
-    to the corresponding HPPC block.
+    to the corresponding HPPC block. The returned table includes
+    ``quality_status``, ``soc_path``, and ``sweep_id``. By default,
+    visualization uses only pass-quality pulses at 4.8 +/- 0.25 A,
+    separates charge/discharge pulses and ascending/descending SOC paths,
+    and uses fixed SOC values of 25%, 50%, and 75% for ageing plots.
     """
 
     if not isinstance(df, pd.DataFrame):
@@ -886,6 +1186,39 @@ def create_ecm_parameters(
         )
     if not isinstance(visualize, bool):
         raise ValueError("visualize must be a boolean.")
+
+    allowed_quality = {"pass", "review", "excluded"}
+    allowed_directions = {"charge", "discharge"}
+    allowed_paths = {"descending", "ascending", "unclear"}
+    if (
+        not plot_quality_statuses
+        or not set(plot_quality_statuses).issubset(allowed_quality)
+    ):
+        raise ValueError(
+            "plot_quality_statuses may contain pass, review, or excluded."
+        )
+    if not set(plot_pulse_directions).issubset(allowed_directions):
+        raise ValueError(
+            "plot_pulse_directions may contain charge or discharge."
+        )
+    if not set(plot_soc_paths).issubset(allowed_paths):
+        raise ValueError(
+            "plot_soc_paths may contain descending, ascending, or unclear."
+        )
+    if (
+        plot_target_current_abs_A is not None
+        and float(plot_target_current_abs_A) <= 0.0
+    ):
+        raise ValueError("plot_target_current_abs_A must be positive or None.")
+    if float(plot_current_tolerance_A) < 0.0:
+        raise ValueError("plot_current_tolerance_A must be non-negative.")
+    if not plot_target_socs or any(
+        not 0.0 <= float(value) <= 1.0
+        for value in plot_target_socs
+    ):
+        raise ValueError("plot_target_socs must contain values from 0 to 1.")
+    if float(plot_soc_tolerance) < 0.0:
+        raise ValueError("plot_soc_tolerance must be non-negative.")
 
     if hppc_segments.empty:
         return pd.DataFrame()
@@ -1065,8 +1398,21 @@ def create_ecm_parameters(
 
     results = pd.DataFrame(result_rows)
 
+    if not results.empty:
+        results = _annotate_quality_status(results)
+        results = _annotate_soc_paths(results)
+
     if visualize and not results.empty:
-        _plot_ecm_parameters(results)
+        _plot_ecm_parameters(
+            parameters=results,
+            quality_statuses=tuple(plot_quality_statuses),
+            pulse_directions=tuple(plot_pulse_directions),
+            soc_paths=tuple(plot_soc_paths),
+            target_current_abs_A=plot_target_current_abs_A,
+            current_tolerance_A=plot_current_tolerance_A,
+            target_socs=tuple(float(value) for value in plot_target_socs),
+            soc_tolerance=float(plot_soc_tolerance),
+        )
 
     return results
 
