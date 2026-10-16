@@ -20,6 +20,11 @@ def add_equivalent_full_cycles(
     Equivalent full cycles are calculated as the absolute charge throughput divided by two times the capacity reference,
     so that every full cycle is counted as one cycle.
 
+    For protocol-aware cycling-ageing FEC, first detect complete ageing cycles
+    and call ``add_equivalent_full_cycles_from_cycles``. Filtering raw samples
+    and concatenating them is unsafe because integration could bridge gaps
+    between separate cycling windows.
+
     Parameters:
         df (pandas.DataFrame): Input DataFrame containing battery test data
         config (BatteryConfig, optional): Configuration for the battery. Defaults to BATTERY_DEFAULT
@@ -63,3 +68,44 @@ def add_equivalent_full_cycles(
         st._log("computed Equivalent Full Cycles")
 
     return df_mod
+
+
+def add_equivalent_full_cycles_from_cycles(
+    cycles: pd.DataFrame,
+    config: _BatteryConfigClass = None,
+    charge_column: str = "charge_ah",
+    discharge_column: str = "discharge_ah",
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Calculate FEC from complete cycles selected by an upstream detector.
+
+    The input must contain one row per accepted cycling-ageing cycle and the
+    charge/discharge throughput of that cycle. Diagnostic measurements are not
+    counted because they are excluded before this function is called. The
+    cumulative selected throughput is then passed to
+    ``add_equivalent_full_cycles`` for the standard PyDPEET FEC calculation.
+
+    Parameters:
+        cycles: One row per accepted cycling-ageing cycle.
+        config: Battery configuration containing the reference capacity.
+        charge_column: Column containing charge throughput magnitudes in Ah.
+        discharge_column: Column containing discharge throughput magnitudes in Ah.
+        verbose: Enable timing messages.
+
+    Returns:
+        A copy of ``cycles`` with ``AbsoluteChargeThroughput[Ah]`` and
+        ``EquivalentFullCycles`` columns.
+    """
+    required = {charge_column, discharge_column}
+    missing = required - set(cycles.columns)
+    if missing:
+        raise KeyError(f"Missing required columns: {sorted(missing)}")
+
+    result = cycles.copy()
+    charge_ah = pd.to_numeric(result[charge_column], errors="coerce").to_numpy(dtype=float)
+    discharge_ah = pd.to_numeric(result[discharge_column], errors="coerce").to_numpy(dtype=float)
+    if not np.isfinite(charge_ah).all() or not np.isfinite(discharge_ah).all():
+        raise ValueError("Cycle charge/discharge throughput must be finite")
+
+    result["AbsoluteChargeThroughput[Ah]"] = np.cumsum(np.abs(charge_ah) + np.abs(discharge_ah))
+    return add_equivalent_full_cycles(result, config=config, verbose=verbose)
