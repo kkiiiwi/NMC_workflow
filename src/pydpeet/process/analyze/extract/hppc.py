@@ -2,7 +2,7 @@
     
     This module first divides complete measurement data into consecutive
     positive-current, negative-current, and rest segments. It then identifies
-    HPPC regions firom repeated pulse-rest-oppsite-pulse patterns.
+    HPPC regions from repeated pulse-rest-opposite-pulse patterns.
 
     Pulse duration, rest duration, current threshold, and repetition
     requirements can be configured by the caller. The module also provides a
@@ -294,15 +294,17 @@ def _segment_complete_data(
     ``Test_Time[s]``, ``Current[A]``, and ``Voltage[V]``. The ``SOC``
     column is optional. Input row order is preserved.
 
-    The caller must provide data that has already been identified as an HPPC block.
+    The input may contain complete measurement data.
+    This function segments current states. HPPC detection is
+    performed later.
     This function does not infer the measurement protocol.
 
     Parameters
     ----------
     df: pd.DataFrame
-        Complete HPPC measurement data.
+        Complete battery measurement data.
     cell_id: str
-        Identifier or the battery cell.
+        Identifier of the battery cell.
 
     Returns
     -------
