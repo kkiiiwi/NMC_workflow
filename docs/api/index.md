@@ -63,7 +63,6 @@ Functions that add derived quantities such as SOC, capacity, or resistance to ex
    pydpeet.add_cumulative_energy
    pydpeet.add_efficiency_coulomb
    pydpeet.add_equivalent_full_cycles
-   pydpeet.add_equivalent_full_cycles_from_cycles
    pydpeet.add_power
    pydpeet.add_resistance_internal
    pydpeet.add_soc

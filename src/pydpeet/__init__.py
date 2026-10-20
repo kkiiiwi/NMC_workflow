@@ -12,10 +12,7 @@ from pydpeet.io.utils import load_custom_module
 from pydpeet.io.write import write
 from pydpeet.process.analyze.capacity import add_capacity, add_charge_throughput
 from pydpeet.process.analyze.configs.battery_config import BatteryConfig, battery_config_wrapper
-from pydpeet.process.analyze.cycle import (
-    add_equivalent_full_cycles,
-    add_equivalent_full_cycles_from_cycles,
-)
+from pydpeet.process.analyze.cycle import add_equivalent_full_cycles
 from pydpeet.process.analyze.efficiency import add_efficiency_coulomb
 from pydpeet.process.analyze.energy import add_cumulative_energy
 from pydpeet.process.analyze.extract.dva_ica import extract_ocv_dva_ica
@@ -96,7 +93,6 @@ __all__ = [
     "add_cumulative_energy",
     "add_efficiency_coulomb",
     "add_equivalent_full_cycles",
-    "add_equivalent_full_cycles_from_cycles",
     "add_power",
     "add_resistance_internal",
     "add_soc",

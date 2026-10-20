@@ -626,6 +626,7 @@ def fit_ecm_pulse(
             "R2_ohm": resistance_2_ohm,
             "R1_mohm": resistance_1_ohm * 1000.0,
             "R2_mohm": resistance_2_ohm * 1000.0,
+            "Rsum_mohm": (resistance_1_ohm + resistance_2_ohm) * 1000.0,
             "C1_F": capacitance_1_F,
             "C2_F": capacitance_2_F,
             "pulse_duration_actual_s": pulse_duration_s,
@@ -669,6 +670,7 @@ _PARAMETER_PLOT_COLUMNS = (
     ("R0_mohm", r"$R_0$ [m$\Omega$]"),
     ("R1_mohm", r"$R_1$ [m$\Omega$]"),
     ("R2_mohm", r"$R_2$ [m$\Omega$]"),
+    ("Rsum_mohm", r"$R_1+R_2$ [m$\Omega$]"),
     ("C1_F", r"$C_1$ [F]"),
     ("C2_F", r"$C_2$ [F]"),
     ("tau_1_s", r"$\tau_1$ [s]"),
@@ -966,14 +968,17 @@ def _select_target_soc_rows(
 
         for target_soc in target_socs:
             distance = (block["SOC"] - float(target_soc)).abs()
-            nearest_index = distance.idxmin()
-            if float(distance.loc[nearest_index]) > (
-                float(soc_tolerance) + 1e-12
-            ):
+            candidates = block.loc[
+                distance <= float(soc_tolerance) + 1e-12
+            ].copy()
+            if candidates.empty:
                 continue
-            row = block.loc[nearest_index].copy()
+            candidates["SOC_distance"] = distance.loc[candidates.index]
+            order_columns = ["SOC_distance"]
+            if "fit_rmse_mV" in candidates.columns:
+                order_columns.append("fit_rmse_mV")
+            row = candidates.sort_values(order_columns, kind="stable").iloc[0].copy()
             row["target_SOC"] = float(target_soc)
-            row["SOC_distance"] = float(distance.loc[nearest_index])
             selected_rows.append(row)
 
     if not selected_rows:
@@ -992,8 +997,15 @@ def _plot_parameters_over_age(
     soc_path: str,
     target_socs: tuple[float, ...],
     soc_tolerance: float,
+    normalize_to_first: bool = False,
 ) -> None:
-    """Plot parameters over ageing at fixed diagnostic SOC values."""
+    """Plot ageing at fixed SOC, optionally relative to each first valid value.
+
+    Normalization is separate for every cell, target SOC, pulse direction,
+    SOC path and parameter. The baseline is the earliest available finite
+    value, which need not be an age-zero measurement. A zero baseline is
+    skipped, matching the NMC workflow's normalization rule.
+    """
 
     rows = parameters.loc[
         parameters["pulse_direction"].eq(pulse_direction)
@@ -1049,19 +1061,36 @@ def _plot_parameters_over_age(
                 errors="coerce",
             )
             series = series.dropna(subset=[x_column, "_value"])
-            series = series.sort_values(x_column, kind="stable")
+            series = series.loc[np.isfinite(series["_value"])]
+            order_columns = [x_column]
+            if "TestIndex" in series.columns:
+                order_columns.append("TestIndex")
+            series = series.sort_values(order_columns, kind="stable")
             if len(series) < 2:
                 continue
+            label = f"{cell_id}, SOC {100.0 * float(target_soc):g}%"
+            if normalize_to_first:
+                baseline = float(series["_value"].iloc[0])
+                if baseline == 0.0:
+                    continue
+                series["_value"] = 100.0 * series["_value"] / baseline
+                reference_age = float(series[x_column].iloc[0])
+                label += f", ref. {reference_age:g}"
             axis.plot(
                 series[x_column],
                 series["_value"],
                 marker="o",
                 markersize=3.5,
                 linewidth=1.2,
-                label=f"{cell_id}, SOC {100.0 * float(target_soc):g}%",
+                label=label,
             )
         axis.set_xlabel(x_label)
-        axis.set_ylabel(y_label)
+        axis.set_ylabel(
+            f"{y_label.split(' [')[0]} [% of first valid]"
+            if normalize_to_first else y_label
+        )
+        if normalize_to_first:
+            axis.axhline(100.0, color="0.65", linewidth=0.7, linestyle="--")
         axis.grid(alpha=0.25)
 
     for axis in flat_axes[len(specs):]:
@@ -1080,7 +1109,7 @@ def _plot_parameters_over_age(
         sorted(rows["quality_status"].astype(str).unique())
     )
     fig.suptitle(
-        f"Second-order RC parameters over {x_label}\n"
+        f"{'Normalized ' if normalize_to_first else ''}Second-order RC parameters over {x_label}\n"
         f"{pulse_direction} pulse, SOC {soc_path}, quality: {quality_label}"
     )
     fig.tight_layout(rect=(0.0, 0.0, 0.80, 0.94))
@@ -1096,6 +1125,7 @@ def _plot_ecm_parameters(
     current_tolerance_A: float,
     target_socs: tuple[float, ...],
     soc_tolerance: float,
+    normalize_to_first: bool = False,
 ) -> None:
     """Create filtered NMC-style SOC and ageing parameter figures."""
 
@@ -1132,6 +1162,7 @@ def _plot_ecm_parameters(
                 soc_path,
                 target_socs,
                 soc_tolerance,
+                normalize_to_first,
             )
             _plot_parameters_over_age(
                 rows,
@@ -1141,6 +1172,7 @@ def _plot_ecm_parameters(
                 soc_path,
                 target_socs,
                 soc_tolerance,
+                normalize_to_first,
             )
 
 
@@ -1165,6 +1197,7 @@ def create_ecm_parameters(
     plot_current_tolerance_A: float = 0.25,
     plot_target_socs: tuple[float, ...] = (0.25, 0.50, 0.75),
     plot_soc_tolerance: float = 0.02,
+    plot_normalize_to_first: bool = True,
 ) -> pd.DataFrame:
     """Fit 2RC parameters using automatically detected HPPC segments.
 
@@ -1176,6 +1209,9 @@ def create_ecm_parameters(
     visualization uses only pass-quality pulses at 4.8 +/- 0.25 A,
     separates charge/discharge pulses and ascending/descending SOC paths,
     and uses fixed SOC values of 25%, 50%, and 75% for ageing plots.
+    Ageing plots default to 100% at each series' first valid measurement;
+    set ``plot_normalize_to_first=False`` to display absolute parameters.
+    Parameter-over-SOC plots retain their physical units.
     """
 
     if not isinstance(df, pd.DataFrame):
@@ -1186,6 +1222,8 @@ def create_ecm_parameters(
         )
     if not isinstance(visualize, bool):
         raise ValueError("visualize must be a boolean.")
+    if not isinstance(plot_normalize_to_first, bool):
+        raise ValueError("plot_normalize_to_first must be a boolean.")
 
     allowed_quality = {"pass", "review", "excluded"}
     allowed_directions = {"charge", "discharge"}
@@ -1412,6 +1450,7 @@ def create_ecm_parameters(
             current_tolerance_A=plot_current_tolerance_A,
             target_socs=tuple(float(value) for value in plot_target_socs),
             soc_tolerance=float(plot_soc_tolerance),
+            normalize_to_first=plot_normalize_to_first,
         )
 
     return results

@@ -355,6 +355,7 @@ def _plot_ocv_curves(
 
     ax.set_xlabel("SOC [%]")
     ax.set_ylabel("OCV [V]")
+    ax.set_title(f"{direction.capitalize()} OCV–SOC")
     ax.set_xlim(0, 100)
 
     ax.grid(
