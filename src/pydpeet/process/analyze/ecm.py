@@ -697,7 +697,7 @@ def _annotate_quality_status(parameters: pd.DataFrame) -> pd.DataFrame:
         pd.Series("", index=rows.index),
     ).fillna("").astype(str).str.strip()
 
-    # 与原 NMC workflow 一致：有效且无警告为 pass，有警告为 review。
+    # valid fits pass without warnings and require review when warnings are present.
     rows["quality_status"] = "excluded"
     rows.loc[valid & flags.eq(""), "quality_status"] = "pass"
     rows.loc[valid & flags.ne(""), "quality_status"] = "review"
@@ -750,7 +750,8 @@ def _annotate_soc_paths(parameters: pd.DataFrame) -> pd.DataFrame:
         minimum_soc = float(np.min(soc))
         maximum_soc = float(np.max(soc))
 
-        # 只有 SOC 两侧都变化至少 20 percentage points，才判定为转折。
+        # Identify a turning only when SOC changes by at least
+        # 20 percentage points on both sides of the extremum.
         down_up = (
             0 < minimum_position < len(ordered) - 1
             and first_soc - minimum_soc >= 0.20
@@ -870,7 +871,7 @@ def _plot_parameters_over_soc(
         ["cell_id", "hppc_block_id"],
         dropna=False,
     )["SOC"].transform("size")
-    # 单点不能构成趋势曲线，因此不在参数图中显示。
+    # Omit isolated points becasuse a trend requires at least two points.
     rows = rows.loc[series_size >= 2]
     if rows.empty:
         return
@@ -1030,8 +1031,8 @@ def _plot_parameters_over_age(
     series_size = rows.groupby(
         ["cell_id", "target_SOC"],
         dropna=False,
-    )[x_column].transform("size")
-    # 老化曲线至少需要两个老化状态，孤立点不显示。
+    )[x_column].transform("nunique")
+    # An ageing curve requires at least two distinct ageing states.
     rows = rows.loc[series_size >= 2]
     if rows.empty:
         return
@@ -1072,6 +1073,11 @@ def _plot_parameters_over_age(
             if "TestIndex" in series.columns:
                 order_columns.append("TestIndex")
             series = series.sort_values(order_columns, kind="stable")
+            series = series.drop_duplicates(
+                subset=[x_column],
+                keep = "last",
+            )
+            
             if len(series) < 2:
                 continue
             label = f"{cell_id}, SOC {100.0 * float(target_soc):g}%"
@@ -1146,7 +1152,8 @@ def _plot_ecm_parameters(
     if rows.empty:
         return
 
-    # 每个脉冲方向和 SOC 路径独立作图，避免同一 SOC 的点被错误连接。
+    # Plot each pulse direction and SOC path separately to avoid
+    # connecting points from different paths at the same SOC.
     for pulse_direction in pulse_directions:
         for soc_path in soc_paths:
             combination = rows.loc[
