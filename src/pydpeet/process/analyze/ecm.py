@@ -490,8 +490,14 @@ def quality_flags(
 
     if not bool(result["optimizer_success"]):
         flags.append("optimizer_not_converged")
-    if float(result["fit_R_squared"]) < 0.98:
+
+    r_squared = float (result["fit_R_squared"])
+
+    if not np.isfinite(r_squared):
+        flags.append("R_squared_not_finite")
+    elif r_squared < 0.98:
         flags.append("R_squared_below_0.98")
+        
     if float(result["fit_rmse_mV"]) > 1.0:
         flags.append("RMSE_above_1mV")
     if float(result["tau_ratio"]) < 2.0:
